@@ -1,0 +1,20 @@
+{
+  "challenge_module": "ReleaseChallenges.admin",
+  "solution_module": "Glibc243UbuntuClients.Admin.Proof",
+  "theorem_names": [
+    "Clients.Admin.holds_proof"
+  ],
+  "permitted_axioms": [
+    "propext",
+    "Quot.sound",
+    "Classical.choice"
+  ],
+  "external_kernels": {
+    "con-leche": [
+      "con-leche"
+    ],
+    "con-ron": [
+      "con-ron"
+    ]
+  }
+}

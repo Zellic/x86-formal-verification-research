@@ -1,0 +1,23 @@
+{
+  "challenge_module": "ReleaseChallenges.memcmp_clang_os",
+  "solution_module": "Examples.Memcmp.ClangOs",
+  "theorem_names": [
+    "Memcmp.clangOs_holds"
+  ],
+  "permitted_axioms": [
+    "propext",
+    "Quot.sound",
+    "Classical.choice"
+  ],
+  "external_kernels": {
+    "con-leche": [
+      "con-leche"
+    ],
+    "con-ron": [
+      "con-ron"
+    ],
+    "nanoda": [
+      "nanoda_bin"
+    ]
+  }
+}

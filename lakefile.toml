@@ -1,0 +1,40 @@
+# The statements of the release: the model of x86-64 Linux user processes and its statement vocabulary (`ZellicX86/`),
+# the trusted loader of binaries (`#file_image`), and the statements of the theorems the exports prove. Lean only: no
+# dependency. `lake build` checks that the statements elaborate and that each binary has the SHA-256 its statement names.
+name = "zellic-x86-release"
+version = "0.1.0"
+defaultTargets = ["ZellicX86", "Examples", "Glibc243Ubuntu", "Glibc243UbuntuClients"]
+# Each Lean process stops with an error above 8 GB rather than exhausting a machine's memory (the statements need
+# under 2 GB; the proofs are checked by `lake comparator`, not built here).
+moreLeanArgs = ["-M8000"]
+moreGlobalServerArgs = ["-M8000"]
+
+[leanOptions]
+autoImplicit = false
+relaxedAutoImplicit = false
+
+# The model and the vocabulary, and the loader, compiled (the loader hashes and reads a binary natively).
+[[lean_lib]]
+name = "ZellicX86"
+roots = []
+globs = ["ZellicX86.Spec.+", "ZellicX86.Load.+"]
+precompileModules = true
+
+[[lean_lib]]
+name = "Examples"
+roots = ["Examples.Memcmp.Code", "Examples.Memcmp.Spec", "Examples.Memcmp.Statement"]
+
+[[lean_lib]]
+name = "Glibc243Ubuntu"
+srcDir = "glibc-2.43-ubuntu-26.04-amd64"
+roots = ["Glibc243Ubuntu.Heap.MemGranted", "Glibc243Ubuntu.TunablesEnv"]
+
+[[lean_lib]]
+name = "Glibc243UbuntuClients"
+srcDir = "glibc-2.43-ubuntu-26.04-amd64"
+roots = ["Glibc243UbuntuClients.Admin.Statement", "Glibc243UbuntuClients.Admin2.Statement", "Glibc243UbuntuClients.Files.Admin", "Glibc243UbuntuClients.Files.Admin2", "Glibc243UbuntuClients.Program.Demo"]
+
+# The challenges: each theorem stated by `sorry`, for `checks/ID/verify-source.sh` (not a default target).
+[[lean_lib]]
+name = "ReleaseChallenges"
+globs = ["ReleaseChallenges.+"]

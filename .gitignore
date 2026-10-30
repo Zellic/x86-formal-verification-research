@@ -1,0 +1,4 @@
+.lake/
+exports/*.ndjson.zst
+checks/*/solution.ndjson.zst
+checks/*/.verify-source.*

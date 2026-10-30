@@ -1,0 +1,23 @@
+{
+  "challenge_module": "ReleaseChallenges.memcmp_gcc_o2",
+  "solution_module": "Examples.Memcmp.GccO2",
+  "theorem_names": [
+    "Memcmp.gccO2_holds"
+  ],
+  "permitted_axioms": [
+    "propext",
+    "Quot.sound",
+    "Classical.choice"
+  ],
+  "external_kernels": {
+    "con-leche": [
+      "con-leche"
+    ],
+    "con-ron": [
+      "con-ron"
+    ],
+    "nanoda": [
+      "nanoda_bin"
+    ]
+  }
+}
