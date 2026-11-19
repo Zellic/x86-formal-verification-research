@@ -78,6 +78,11 @@ inductive Op
   then writes the same operand: such a read already needs write permission (a
   read-for-ownership, SDM Vol. 3A, 5.7, error-code bit W). -/
   | load (m : MemRef) (w : Nat) (acc : Access)
+  /-- A selected gather-element read. A fault stops explicitly not modelled: gather faults
+  can commit destination/mask progress, outside the current instruction-atomic interpreter
+  (SDM Vol. 2C, gathers, Description; APM Vol. 4, gathers). This primitive never delivers
+  an exception with the instruction's entry state. -/
+  | gatherLoad (m : MemRef) (w : Nat)
   /-- Store `v` (`w / 8` bytes) at `m`. -/
   | store (m : MemRef) (w : Nat) (v : BitVec w)
   /-- Load the bytes `i < n` at `m` for which bit `i` of `sel` is set; the others read as 0.
@@ -99,11 +104,13 @@ inductive Op
   | checkAligned (m : MemRef) (n : Nat) (acc : Access) (b : Nat) (mm : Bool)
   /-- Continue if none of the accesses `as` (reference, kind, bytes) faults; otherwise raise the
   exception of one that does. For an instruction with several memory operands (`MOVS`, `CMPS`)
-  this comes before the accesses themselves: which operand's fault is reported when more than
+  this comes before the accesses themselves. With `onFault = some what`, any failed check
+  ends explicitly not modelled instead of selecting an exception: used for implementation-dependent
+  optional access footprints (XSAVE, SDM Vol. 1 §13.13). Without `onFault`, which operand's fault is reported when more than
   one faults is not specified (SDM Vol. 3A, 7.9, after Table 7-2; AMD APM Vol. 2, 8.5,
   Table 8-9, one priority class), and an AMD Zen 4 reports the source's for `MOVS` and
   `REPE CMPS` but the destination's for `CMPS` without a prefix. -/
-  | checkAll (as : List (MemRef × Access × Nat))
+  | checkAll (as : List (MemRef × Access × Nat)) (onFault : Option NotModelled := none)
   | fence (f : Fence)
   /-- A `w`-bit value the manuals leave undefined. -/
   | choose (w : Nat)
@@ -117,10 +124,17 @@ inductive Op
   | xinuse (enabled : BitVec 64)
   | raise (e : Exception)
   | notModelled (what : NotModelled)
+  /-- Snapshot the architectural CPU state, for state-management instructions (SDM Vol. 1 ch.13).
+  Memory accesses remain separate program operations. -/
+  | getCpu
+  /-- Replace the CPU state with `c`; the caller's state transformation specifies the fields
+  changed (XRSTOR's x87/vector/PKRU fields, SDM Vol. 1 §13.8). -/
+  | setCpu (c : Cpu)
 
 /-- What a step gives the rest of the program: the value read, or nothing; a stop gives nothing
 to continue with. -/
 def Op.Ret : Op → Type
+  | .getCpu => Cpu
   | .getReg _ => BitVec 64
   | .getRip => Addr
   | .getFlags => Rflags
@@ -130,7 +144,7 @@ def Op.Ret : Op → Type
   | .getK _ => BitVec 64
   | .getMxcsr => BitVec 32
   | .getX87 => X87
-  | .load _ w _ => BitVec w
+  | .load _ w _ | .gatherLoad _ w => BitVec w
   | .loadSel _ n _ _ => BitVec (8 * n)
   | .rmw _ w _ => BitVec w
   | .choose w => BitVec w
@@ -140,7 +154,7 @@ def Op.Ret : Op → Type
   | .raise _ | .notModelled _ => Empty
   | .setReg .. | .setRip _ | .setFlags _ | .setZmm .. | .setK .. | .setMxcsr _ | .setX87 _ | .store ..
   | .storeSel ..
-  | .checkAligned .. | .checkAll _ | .fence _ => Unit
+  | .checkAligned .. | .checkAll .. | .setCpu _ | .fence _ => Unit
 
 /-- An instruction program returning `α`: steps, each continued with what it gives. -/
 inductive Prog (α : Type) where
@@ -159,6 +173,10 @@ instance : Monad Prog where
 
 namespace Prog
 /-! The primitive steps as monadic operations. -/
+/-- Snapshot the architectural CPU state (`Op.getCpu`). -/
+def readCpu : Prog Cpu := .op .getCpu .pure
+/-- Set the CPU state as transformed by a state-management instruction (`Op.setCpu`). -/
+def writeCpu (c : Cpu) : Prog Unit := .op (.setCpu c) .pure
 /-- Read general register `r`. -/
 def readReg (r : Reg) : Prog (BitVec 64) := .op (.getReg r) .pure
 /-- Write general register `r`. -/
@@ -200,6 +218,10 @@ def writeSel (m : MemRef) (n : Nat) (sel : BitVec n) (v : BitVec (8 * n)) : Prog
 /-- Load `w / 8` bytes at `m`. -/
 def read (m : MemRef) (w : Nat) (acc : Access := .read) : Prog (BitVec w) :=
   .op (.load m w acc) .pure
+/-- Read a selected gather element; an access fault is explicitly not modelled
+until committed partial-fault state is supported (`Op.gatherLoad`). -/
+def readGather (m : MemRef) (w : Nat) : Prog (BitVec w) :=
+  .op (.gatherLoad m w) .pure
 /-- Store `v` at `m`. -/
 def write (m : MemRef) (w : Nat) (v : BitVec w) : Prog Unit := .op (.store m w v) .pure
 /-- Atomically replace the `w / 8` bytes at `m` by `f` of their value; the old value. -/
@@ -210,7 +232,8 @@ with `mm`, `MXCSR.MM` is set (`Op.checkAligned`). -/
 def alignedTo (m : MemRef) (n : Nat) (acc : Access) (b : Nat) (mm : Bool) : Prog Unit :=
   .op (.checkAligned m n acc b mm) .pure
 /-- Raise the exception of one of the accesses `as` that faults, if any. -/
-def checkAccesses (as : List (MemRef × Access × Nat)) : Prog Unit := .op (.checkAll as) .pure
+def checkAccesses (as : List (MemRef × Access × Nat)) (onFault : Option NotModelled := none) : Prog Unit :=
+  .op (.checkAll as onFault) .pure
 /-- A `w`-bit value the manuals leave undefined. -/
 def undefined (w : Nat) : Prog (BitVec w) := .op (.choose w) .pure
 /-- One of `n + 1` alternatives. -/
@@ -325,6 +348,8 @@ def State.modCpu (s : State) (f : Cpu → Cpu) : State := { s with cpu := f s.cp
 kernel's treatment of split locks `sl` (`LinuxBoot.splitLock`). -/
 def Prog.run {α : Type} (feat : Features) (sl : SplitLock) : Prog α → State → Req (Result α)
   | .pure a, s => Pure.pure (.ok a s)
+  | .op .getCpu k, s => (k s.cpu).run feat sl s
+  | .op (.setCpu c) k, s => (k ()).run feat sl { s with cpu := c }
   | .op (.getReg r) k, s => (k (s.cpu.gpr.get r)).run feat sl s
   | .op (.setReg r v) k, s =>
     (k ()).run feat sl (s.modCpu fun c => { c with gpr := c.gpr.set r v })
@@ -351,6 +376,10 @@ def Prog.run {α : Type} (feat : Features) (sl : SplitLock) : Prog α → State 
     match ← checkAccess feat s m acc (w / 8) with
     | some (.ok e) => Pure.pure (.exception e)
     | some (.error nm) => Pure.pure (.notModelled nm)
+    | none => (k (ofBytesLE w (readBytes s.proc.mm.mem m.addr (w / 8)))).run feat sl s
+  | .op (.gatherLoad m w) k, s => do
+    match ← checkAccess feat s m .read (w / 8) with
+    | some _ => Pure.pure (.notModelled (.feature "gather partial progress on fault or alignment checking"))
     | none => (k (ofBytesLE w (readBytes s.proc.mm.mem m.addr (w / 8)))).run feat sl s
   | .op (.store m w v) k, s => do
     match ← checkAccess feat s m .write (w / 8) with
@@ -401,21 +430,23 @@ def Prog.run {α : Type} (feat : Features) (sl : SplitLock) : Prog α → State 
     | some (.ok e) => do
       let i ← Req.request (.pick 1)
       Pure.pure (.exception (if i.val = 0 then .gp 0 else e))
-  | .op (.checkAll as) k, s => do
+  | .op (.checkAll as onFault) k, s => do
     match ← checkEach feat s as with
     | [] => (k ()).run feat sl s
-    | [.ok e] => Pure.pure (.exception e)
-    | rs =>
-      -- an access that needs something not modelled makes the instruction not modelled;
-      -- among faults, which one is raised is a `pick`
-      match rs.findSome? (fun | .error nm => some nm | .ok _ => none) with
-      | some nm => Pure.pure (.notModelled nm)
-      | none => do
-        let i ← Req.request (.pick (rs.length - 1))
-        match rs[i.val]? with
-        | some (.ok e) => Pure.pure (.exception e)
-        -- unreachable: the pick is below the list's length
-        | _ => Pure.pure (.notModelled (.feature "fault selection"))
+    | rs => match onFault with
+      | some what => Pure.pure (.notModelled what)
+      | none => match rs with
+        | [.ok e] => Pure.pure (.exception e)
+        | _ =>
+          -- An unmodelled access makes the instruction unmodelled; otherwise any
+          -- competing fault can be delivered (SDM Vol. 3A §7.9).
+          match rs.findSome? (fun | .error nm => some nm | .ok _ => none) with
+          | some nm => Pure.pure (.notModelled nm)
+          | none => do
+            let i ← Req.request (.pick (rs.length - 1))
+            match rs[i.val]? with
+            | some (.ok e) => Pure.pure (.exception e)
+            | _ => Pure.pure (.notModelled (.feature "fault selection"))
   | .op (.fence _) k, s => (k ()).run feat sl s
   | .op (.choose w) k, s => do
     let v ← Req.request (.undefined w)

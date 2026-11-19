@@ -1,0 +1,23 @@
+{
+  "challenge_module": "ReleaseChallenges.memrchr_sse2",
+  "solution_module": "Glibc243Ubuntu.MemrchrSse2",
+  "theorem_names": [
+    "Glibc243Ubuntu.Memrchr.sse2_holds"
+  ],
+  "permitted_axioms": [
+    "propext",
+    "Quot.sound",
+    "Classical.choice"
+  ],
+  "external_kernels": {
+    "con-leche": [
+      "con-leche"
+    ],
+    "con-ron": [
+      "con-ron"
+    ],
+    "nanoda": [
+      "nanoda_bin"
+    ]
+  }
+}

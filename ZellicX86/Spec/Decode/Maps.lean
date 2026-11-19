@@ -464,9 +464,13 @@ def twoByte : Nat → Entry
   -- `F3` column `/5`, `INCSSPD`/`INCSSPQ` on a processor with CET shadow stacks (without them no manual
   -- specifies it: not modelled)
   | 0xAE => .byPfx (.byMod (.grp (op (.x87 .fxsave) [Mb 512]) (op (.x87 .fxrstor) [Mb 512]) (fp .ldmxcsr [E d])
-                                  (fp .stmxcsr [E d]) .nm .nm .nm .nm)
-                            (.grp .nm .nm .nm .nm .nm (op .lfence []) (op .mfence []) (op .sfence [])))
+                                  (fp .stmxcsr [E d]) (op .xsave [M]) (op .xrstor [M]) .nm .nm)
+                            (.grp .nm .nm .nm .nm (.invalid (op .xsave [M])) (op .lfence []) (op .mfence []) (op .sfence [])))
                    .nm (.byMod .nm (.grp .nm .nm .nm .nm .nm (.byFeat .cetSs (op .incssp [E y]) .nm) .nm .nm)) .nm
+  -- XSAVEC: memory-only 0F C7 /4; REX.W selects 64-bit x87 pointers.
+  -- SDM Vol. 2D XSAVEC; APM Vol. 4 XSAVEC. The access extent is dynamic.
+  | 0xC7 => .byPfx (.byMod (.grp .nm .nm .nm .nm (needs .xsavec (op .xsavec [M])) .nm .nm .nm)
+                       (.grp .nm .nm .nm .nm (.invalid (needs .xsavec (op .xsavec [M]))) .nm .nm .nm)) .nm .nm .nm
   | 0xAF => op .imul [G v, E v]
   | 0xB0 => op .cmpxchg [E b, G b] {lock := true}
   | 0xB1 => op .cmpxchg [E v, G v] {lock := true}
@@ -504,11 +508,11 @@ def twoByte : Nat → Entry
   | 0xD7 => .byPfx .nm (sse .pmovmskb [G d, U]) .nm .nm
   | 0xD8 => .byPfx .nm (sse .psubusb [V, W dq]) .nm .nm
   | 0xD9 => .byPfx .nm (sse .psubusw [V, W dq]) .nm .nm
-  | 0xDA => .byPfx .nm (sse .pminub [V, W dq]) .nm .nm
+  | 0xDA => .byPfx .nm (sse (.pminu 8) [V, W dq]) .nm .nm
   | 0xDB => .byPfx .nm (sse .pand [V, W dq]) .nm .nm
   | 0xDC => .byPfx .nm (sse .paddusb [V, W dq]) .nm .nm
   | 0xDD => .byPfx .nm (sse .paddusw [V, W dq]) .nm .nm
-  | 0xDE => .byPfx .nm (sse .pmaxub [V, W dq]) .nm .nm
+  | 0xDE => .byPfx .nm (sse (.pmaxu 8) [V, W dq]) .nm .nm
   | 0xDF => .byPfx .nm (sse .pandn [V, W dq]) .nm .nm
   | 0xE1 => .byPfx .nm (sse .psraw [V, W dq]) .nm .nm
   | 0xE2 => .byPfx .nm (sse .psrad [V, W dq]) .nm .nm
@@ -541,14 +545,36 @@ def twoByte : Nat → Entry
   | 0xE0 => .byPfx .nm (sse .pavgb [V, W dq]) .nm .nm
   | 0xE3 => .byPfx .nm (sse .pavgw [V, W dq]) .nm .nm
   | 0xF6 => .byPfx .nm (sse .psadbw [V, W dq]) .nm .nm
+  | 0xEA => .byPfx .nm (sse (.pmins 16) [V, W dq]) .nm .nm
+  | 0xEE => .byPfx .nm (sse (.pmaxs 16) [V, W dq]) .nm .nm
   | _ => .nm
 
 /-- The three-byte map `0F 38 xx`, SDM Table A-4. -/
 def map0F38 : Nat → Entry
+  -- Packed widening: SDM Vol. 2B PMOVSX/PMOVZX; APM Vol. 4 (V)PMOVSX*/(V)PMOVZX*.
+  | 0x20 => .byPfx .nm (needs .sse41 (sse .pmovsxbw [V, W q])) .nm .nm
+  | 0x21 => .byPfx .nm (needs .sse41 (sse .pmovsxbd [V, W d])) .nm .nm
+  | 0x22 => .byPfx .nm (needs .sse41 (sse .pmovsxbq [V, W w])) .nm .nm
+  | 0x23 => .byPfx .nm (needs .sse41 (sse .pmovsxwd [V, W q])) .nm .nm
+  | 0x24 => .byPfx .nm (needs .sse41 (sse .pmovsxwq [V, W d])) .nm .nm
+  | 0x25 => .byPfx .nm (needs .sse41 (sse .pmovsxdq [V, W q])) .nm .nm
+  | 0x30 => .byPfx .nm (needs .sse41 (sse .pmovzxbw [V, W q])) .nm .nm
+  | 0x31 => .byPfx .nm (needs .sse41 (sse .pmovzxbd [V, W d])) .nm .nm
+  | 0x32 => .byPfx .nm (needs .sse41 (sse .pmovzxbq [V, W w])) .nm .nm
+  | 0x33 => .byPfx .nm (needs .sse41 (sse .pmovzxwd [V, W q])) .nm .nm
+  | 0x34 => .byPfx .nm (needs .sse41 (sse .pmovzxwq [V, W d])) .nm .nm
+  | 0x35 => .byPfx .nm (needs .sse41 (sse .pmovzxdq [V, W q])) .nm .nm
   | 0x00 => .byPfx .nm (needs .ssse3 (sse .pshufb [V, W dq])) .nm .nm
   | 0x2B => .byPfx .nm (needs .sse41 (sse .packusdw [V, W dq])) .nm .nm
-  -- 66 0F 38 3B /r, xmm, xmm/m128 (SDM PMINUD, encoding A).
-  | 0x3B => .byPfx .nm (needs .sse41 (sse .pminud [V, W dq])) .nm .nm
+  -- SDM PMIN*/PMAX*; APM Vol.4 corresponding pages (pp.521–560).
+  | 0x38 => .byPfx .nm (needs .sse41 (sse (.pmins 8) [V, W dq])) .nm .nm
+  | 0x39 => .byPfx .nm (needs .sse41 (sse (.pmins 32) [V, W dq])) .nm .nm
+  | 0x3A => .byPfx .nm (needs .sse41 (sse (.pminu 16) [V, W dq])) .nm .nm
+  | 0x3B => .byPfx .nm (needs .sse41 (sse (.pminu 32) [V, W dq])) .nm .nm
+  | 0x3C => .byPfx .nm (needs .sse41 (sse (.pmaxs 8) [V, W dq])) .nm .nm
+  | 0x3D => .byPfx .nm (needs .sse41 (sse (.pmaxs 32) [V, W dq])) .nm .nm
+  | 0x3E => .byPfx .nm (needs .sse41 (sse (.pmaxu 16) [V, W dq])) .nm .nm
+  | 0x3F => .byPfx .nm (needs .sse41 (sse (.pmaxu 32) [V, W dq])) .nm .nm
   | 0xCB => .byPfx (needs .sha (sse .sha256rnds2 [V, W dq, XMM0])) .nm .nm .nm
   | 0xCC => .byPfx (needs .sha (sse .sha256msg1 [V, W dq])) .nm .nm .nm
   | 0xCD => .byPfx (needs .sha (sse .sha256msg2 [V, W dq])) .nm .nm .nm
@@ -629,9 +655,10 @@ is its low 64 bits (SDM Vol. 2B, the packed-shift pages, operand encoding C). -/
 def vexShiftCount (m : AvxMn) : Entry :=
   vexL .avx .avx2 (avx m [vecR x, vecV x, vecM dq])
 
-/-- Insert/extract a 128-bit half of a YMM register: `L=1`, `W=0` only (SDM Vol. 2C,
+/-- VEX.256 `L=1`, `W=0` forms: half inserts/extracts and integer permutations (SDM Vol. 2C,
 "VINSERTI128", "VEXTRACTI128", "VINSERTF128", "VEXTRACTF128"; AMD APM Vol. 4,
-the same instruction pages: `#UD` with `W=1` or `L=0`; the SDM `W=1` rule is
+the same instruction pages; VPERMD and VPERM2I128: SDM Vol. 2C, APM Vol. 4
+pp. 1340–1341 and 1336–1337. `#UD` with `W=1` or `L=0`; the SDM `W=1` rule is
 Vol. 2A Table 2-16, "#UD If VEX.W = 1 in All Modes"). -/
 def vexHalf (f : Feat) (m : AvxMn) (ops : List OS) : Entry :=
   let e := avx m ops
@@ -661,6 +688,8 @@ def vex0F : Nat → Entry
                    .nm .nm
   | 0x2A => .byPfx .nm .nm (vexL .avx .avx (fp (.cvtsi2 .ss) [vecR dq, vecV dq, E y]))
                    (vexL .avx .avx (fp (.cvtsi2 .sd) [vecR dq, vecV dq, E y]))
+  -- SDM Vol. 2B MOVNTPS; AMD APM Vol. 4 pp. 324–325: memory only, AVX at both lengths.
+  | 0x2B => .byPfx (.byMod (vexL .avx .avx (avx .vmovntps [vecM x, vecR x])) (.ud [])) .nm .nm .nm
   | 0x2C => .byPfx .nm .nm (vexL .avx .avx (fp (.cvtt2si .ss) [G y, vecM d]))
                    (vexL .avx .avx (fp (.cvtt2si .sd) [G y, vecM q]))
   | 0x2D => .byPfx .nm .nm (vexL .avx .avx (fp (.cvt2si .ss) [G y, vecM d]))
@@ -717,12 +746,16 @@ def vex0F : Nat → Entry
                    .nm .nm
   | 0x6F => .byPfx .nm (vexL .avx .avx (avx .vmovdqa [vecR x, vecM x]))
                    (vexL .avx .avx (avx .vmovdqu [vecR x, vecM x])) .nm
+  -- SDM Vol. 2B PSHUFD/PSHUFLW/PSHUFHW; APM Vol. 4 pp. 628–638.
+  | 0x70 => .byPfx .nm (vexL .avx .avx2 (avx .vpshufd [vecR x, vecM x, I b]))
+                   (vexL .avx .avx2 (avx .vpshufhw [vecR x, vecM x, I b]))
+                   (vexL .avx .avx2 (avx .vpshuflw [vecR x, vecM x, I b]))
   | 0x71 => .byPfx .nm (.grp .nm .nm (vexShiftImm (.vpsrl 16)) .nm
                         (vexShiftImm (.vpsra 16)) .nm (vexShiftImm (.vpsll 16)) .nm) .nm .nm
   | 0x72 => .byPfx .nm (.grp .nm .nm (vexShiftImm (.vpsrl 32)) .nm
                         (vexShiftImm (.vpsra 32)) .nm (vexShiftImm (.vpsll 32)) .nm) .nm .nm
-  | 0x73 => .byPfx .nm (.grp .nm .nm (vexShiftImm (.vpsrl 64)) .nm
-                        .nm .nm (vexShiftImm (.vpsll 64)) .nm) .nm .nm
+  | 0x73 => .byPfx .nm (.grp .nm .nm (vexShiftImm (.vpsrl 64)) (vexShiftImm .vpsrldq)
+                        .nm .nm (vexShiftImm (.vpsll 64)) (vexShiftImm .vpslldq)) .nm .nm
   | 0x74 => .byPfx .nm (vex3 (.vpcmpeq 8)) .nm .nm
   | 0x75 => .byPfx .nm (vex3 (.vpcmpeq 16)) .nm .nm
   | 0x76 => .byPfx .nm (vex3 (.vpcmpeq 32)) .nm .nm
@@ -796,6 +829,9 @@ def vex0F : Nat → Entry
                    (.byL (needs .avx (fp .cvtdq2pd [vecR x, vecM q])) (needs .avx (fp .cvtdq2pd [vecR x, vecM dq])) .nm .nm)
                    (vexL .avx .avx (fp .cvtpd2dq [vecR dq, vecM x]))
   | 0xE7 => .byPfx .nm (.byMod (vexL .avx .avx (avx .vmovntdq [vecM x, vecR x])) (.ud [])) .nm .nm
+  | 0xC5 =>
+    let e := avx (.vpextr 16) [G d, vecU dq, I b]
+    .byPfx .nm (l0 (needs .avx (.byMod (.invalid e) e))) .nm .nm
   | 0xE8 => .byPfx .nm (vex3 (.vpsubs 8)) .nm .nm
   | 0xE9 => .byPfx .nm (vex3 (.vpsubs 16)) .nm .nm
   | 0xEA => .byPfx .nm (vex3 (.vpmins 16)) .nm .nm
@@ -841,9 +877,71 @@ def vexFma (order : FmaOrder) (np sa scalar : Bool) : Entry :=
   .byPfx .nm (.byW (one (if scalar then .ss else .ps) (if scalar then d else x))
                         (one (if scalar then .sd else .pd) (if scalar then q else x))) .nm .nm
 
+/-- VEX packed sign/zero extension (SDM Vol. 2B, "PMOVSX", "PMOVZX"; AMD APM Vol. 4,
+`VPMOVSX*`/`VPMOVZX*` encoding and support tables). AVX for 128-bit, AVX2 for 256-bit
+results; `W` keeps register sources at XMM width while `s128`/`s256` give the smaller memory
+widths. `VEX.W` is ignored; `vvvv` is reserved (no `vecV` operand). -/
+def vexPmov (m : AvxMn) (s128 s256 : Sz) : Entry :=
+  let e128 := needs .avx (avx m [vecR dq, W s128])
+  let e256 := needs .avx2 (avx m [vecR x, W s256])
+  .byPfx .nm (.byL e128 e256 (.invalid e128) (.invalid e128)) .nm .nm
+
+/-- The gathers. Executed element by element (`Op.gatherLoad`); an element access
+that faults ends as not modelled, pending a committed fault state and a repeatable
+completion policy. VSIB indices are signed
+32/64-bit elements; mixed data/index sizes use a narrower destination or index
+register. VEX requires AVX2; EVEX AVX512F/VL, a nonzero merging-only mask and
+scalar disp8*N (N = data element bytes). SDM Vol. 2C VGATHER*/VPGATHER*;
+AMD APM Vol. 4 §1.3 and the gather encoding/exception tables. -/
+def gatherEntry (m : AvxMn) (ib data : Nat) (evex : Bool) : Entry :=
+  let row (dst ix : Sz) :=
+    avx m ([vecR dst, .vsib ib ix (if data = 64 then q else d)] ++
+      if evex then [] else [vecV dst])
+      { gather := true, masking := if evex then .merge else .none,
+        disp8 := .scalar (data / 8) }
+  let a := row dq dq
+  let b := row (if ib = 64 && data = 32 then dq else x)
+               (if ib = 32 && data = 64 then dq else x)
+  let c := row (if ib = 64 && data = 32 then qq else x)
+               (if ib = 32 && data = 64 then qq else x)
+  if evex then evexL [] (.byL a b c (.invalid c))
+  else vexL .avx2 .avx2 (.byL a b (.invalid a) (.invalid a))
+
 /-- The VEX map `0F 38` (`VEX.mmmmm = 2`): vector instructions, and BMI1 and BMI2 on general
 registers (`VEX.LZ`). -/
 def vex0F38 : Nat → Entry
+  -- SDM Vol.2C VPERMILPS/PD pp.5-511–521; APM Vol.4 pp.1362–1367.
+  -- Both precisions use W0 in VEX; the variable control is the memory operand.
+  | 0x0C =>
+    let e := avx .vpermilps [vecR x, vecV x, vecM x]
+    .byPfx .nm (vexL .avx .avx (.byW e (.invalid e))) .nm .nm
+  | 0x0D =>
+    let e := avx .vpermilpd [vecR x, vecV x, vecM x]
+    .byPfx .nm (vexL .avx .avx (.byW e (.invalid e))) .nm .nm
+  -- SDM VPERMPS pp.5-526–528; APM pp.1371–1372: AVX2, W0, 256 only.
+  | 0x16 => .byPfx .nm (vexHalf .avx2 .vpermps [vecR x, vecV x, vecM x]) .nm .nm
+  -- VEX.256 W0 only: SDM Vol. 2C VPERMD; APM Vol. 4 pp. 1340–1341.
+  | 0x90 => .byPfx .nm (.byW (gatherEntry .vpgatherdd 32 32 false)
+                            (gatherEntry .vpgatherdq 32 64 false)) .nm .nm
+  | 0x91 => .byPfx .nm (.byW (gatherEntry .vpgatherqd 64 32 false)
+                            (gatherEntry .vpgatherqq 64 64 false)) .nm .nm
+  | 0x92 => .byPfx .nm (.byW (gatherEntry .vgatherdps 32 32 false)
+                            (gatherEntry .vgatherdpd 32 64 false)) .nm .nm
+  | 0x93 => .byPfx .nm (.byW (gatherEntry .vgatherqps 64 32 false)
+                            (gatherEntry .vgatherqpd 64 64 false)) .nm .nm
+  | 0x36 => .byPfx .nm (vexHalf .avx2 .vpermd [vecR x, vecV x, vecM x]) .nm .nm
+  | 0x20 => vexPmov .vpmovsxbw q dq
+  | 0x21 => vexPmov .vpmovsxbd d q
+  | 0x22 => vexPmov .vpmovsxbq w d
+  | 0x23 => vexPmov .vpmovsxwd q dq
+  | 0x24 => vexPmov .vpmovsxwq d q
+  | 0x25 => vexPmov .vpmovsxdq q dq
+  | 0x30 => vexPmov .vpmovzxbw q dq
+  | 0x31 => vexPmov .vpmovzxbd d q
+  | 0x32 => vexPmov .vpmovzxbq w d
+  | 0x33 => vexPmov .vpmovzxwd q dq
+  | 0x34 => vexPmov .vpmovzxwq d q
+  | 0x35 => vexPmov .vpmovzxdq q dq
   | 0x00 => .byPfx .nm (vexL .avx .avx2 (avx .vpshufb [vecR x, vecV x, vecM x])) .nm .nm
   | 0x18 => vexBcst .vbroadcastss d .avx
   | 0x29 => .byPfx .nm (vex3 (.vpcmpeq 64)) .nm .nm
@@ -905,12 +1003,32 @@ def vex0F38 : Nat → Entry
 
 /-- The VEX map `0F 3A` (`VEX.mmmmm = 3`). -/
 def vex0F3A : Nat → Entry
+  -- Immediate lane permutations reserve vvvv; both VEX precisions use W0.
+  | 0x04 =>
+    let e := avx .vpermilps [vecR x, vecM x, I b]
+    .byPfx .nm (vexL .avx .avx (.byW e (.invalid e))) .nm .nm
+  | 0x05 =>
+    let e := avx .vpermilpd [vecR x, vecM x, I b]
+    .byPfx .nm (vexL .avx .avx (.byW e (.invalid e))) .nm .nm
+  -- SDM VPERMPD pp.5-522–525; APM pp.1368–1370: W1, 256 only.
+  | 0x01 =>
+    let e := avx .vpermpd [vecR x, vecM x, I b]
+    .byPfx .nm (needs .avx2 (.byL (.invalid e) (.byW (.invalid e) e) (.invalid e) (.invalid e))) .nm .nm
+  -- SDM PALIGNR, pp.4-216–219; APM Vol.4 PALIGNR/VPALIGNR, pp.419–421.
+  | 0x0F => .byPfx .nm (vexL .avx .avx2 (avx .vpalignr [vecR x, vecV x, vecM x, I b])) .nm .nm
+  -- W1 and L1, reserved vvvv: SDM Vol. 2C VPERMQ; APM Vol. 4 pp. 1373–1375.
+  | 0x00 =>
+    let e := avx .vpermq [vecR x, vecM x, I b]
+    .byPfx .nm (needs .avx2 (.byL (.invalid e) (.byW (.invalid e) e) (.invalid e) (.invalid e))) .nm .nm
+  -- SDM Vol. 2C VPERM2I128; APM Vol. 4 pp. 1336–1337.
+  | 0x46 => .byPfx .nm (vexHalf .avx2 .vperm2i128 [vecR x, vecV x, vecM x, I b]) .nm .nm
   | 0x08 => .byPfx .nm (vexL .avx .avx (fp (.round .ps) [vecR x, vecM x, I b])) .nm .nm
   | 0x09 => .byPfx .nm (vexL .avx .avx (fp (.round .pd) [vecR x, vecM x, I b])) .nm .nm
   | 0x0A => .byPfx .nm (vexL .avx .avx (fp (.round .ss) [vecR dq, vecV dq, vecM d, I b])) .nm .nm
   | 0x0B => .byPfx .nm (vexL .avx .avx (fp (.round .sd) [vecR dq, vecV dq, vecM q, I b])) .nm .nm
   -- `W1` is ignored for the byte forms in 64-bit mode (SDM PINSRB/PEXTRB, footnote 1).
   | 0x14 => .byPfx .nm (l0 (needs .avx (avx (.vpextr 8) [ER d b, vecR dq, I b]))) .nm .nm
+  | 0x15 => .byPfx .nm (l0 (needs .avx (avx (.vpextr 16) [ER d w, vecR dq, I b]))) .nm .nm
   | 0x16 => .byPfx .nm (l0 (needs .avx (.byW (avx (.vpextr 32) [E d, vecR dq, I b])
                                            (avx (.vpextr 64) [E q, vecR dq, I b])))) .nm .nm
   | 0x18 => .byPfx .nm (vexHalf .avx .vinsertf128 [vecR x, vecV x, vecM dq, I b]) .nm .nm
@@ -970,6 +1088,36 @@ def toK : List OS := [kR, vecV x, vecM x]
 def evex128 (e : Entry) : Entry :=
   needs .avx512f (.byL e (.invalid e) (.invalid e) (.invalid e))
 
+/-- EVEX integer/floating subvector extraction. A 128-bit result permits YMM/ZMM
+sources; a 256-bit result only ZMM. The 32x4 and 64x4 forms need F, the 64x2 and
+32x8 forms DQ (VL additionally for YMM). ModRM.reg is the source, r/m the result;
+memory permits merging only and its compressed displacement scales by the result
+extent, independently of source VL. SDM Vol. 2C VEXTRACTI128/… and VEXTRACTF128/…;
+AMD APM Vol. 4, the corresponding VEXTRACTI*/VEXTRACTF* encoding tables. -/
+def evexExtract (m : Nat → Nat → AvxMn) (n : Nat) : Entry :=
+  let row (e : Nat) (fs : List Feat) : Entry :=
+    let ops := [vecM (if n = 128 then dq else qq), vecR x, I b]
+    let raw := .byMod (avx (m e n) ops { masking := .merge, disp8 := .scalar (n / 8) })
+                     (avx (m e n) ops { masking := .full, disp8 := .scalar (n / 8) })
+    evexL fs (.byL (.invalid raw) (if n = 128 then raw else .invalid raw) raw (.invalid raw))
+  .byW (row 32 (if n = 256 then [.avx512dq] else []))
+       (row 64 (if n = 128 then [.avx512dq] else []))
+
+/-- EVEX integer/floating insertion of an `n`-bit subvector into YMM/ZMM.
+The 32x4 and 64x4 forms need F, the 64x2 and 32x8 forms DQ, with VL for YMM.
+ModRM.reg is the destination, vvvv the full-width source, r/m the narrow source.
+The compressed displacement scales by `n/8`; E6NF reads that entire source even
+under an empty mask. SDM Vol. 2C VINSERTI128/… pp. 5-411–415 and VINSERTF128/…
+pp. 5-405–410; AMD APM Vol. 4 VINSERTI32X4/… pp. 1208–1211 and
+VINSERTF32X4/… pp. 1202–1205. -/
+def evexInsert (m : Nat → Nat → AvxMn) (n : Nat) : Entry :=
+  let row (e : Nat) (fs : List Feat) : Entry :=
+    let raw := avx (m e n) [vecR x, vecV x, vecM (if n = 128 then dq else qq), I b]
+      { masking := .full, disp8 := .scalar (n / 8) }
+    evexL fs (.byL (.invalid raw) (if n = 128 then raw else .invalid raw) raw (.invalid raw))
+  .byW (row 32 (if n = 256 then [.avx512dq] else []))
+       (row 64 (if n = 128 then [.avx512dq] else []))
+
 /-- An EVEX move `m` of doublewords without a mandatory prefix (`W0`; `W1` invalid, as for `evexD`),
 load (`ld`) or store, with features `fs`: a store to memory merges only, a register destination
 may also zero. -/
@@ -980,10 +1128,30 @@ def evexMov (m : AvxMn) (ld : Bool) (fs : List Feat := []) : Entry :=
 
 /-- The EVEX map `0F` (`EVEX.mmm = 1`). -/
 def evex0F : Nat → Entry
+  -- SDM Vol. 2B PSHUF*/PS*DQ; AMD APM Vol. 4 pp. 628–637, 647–648, 664–665.
+  | 0x70 => .byPfx .nm (evexD .vpshufd [vecR x, vecM x, I b])
+                   (evexBW .vpshufhw [vecR x, vecM x, I b])
+                   (evexBW .vpshuflw [vecR x, vecM x, I b])
+  -- Immediate shifts: vvvv is the destination; r/m may be memory. SDM Vol. 2B
+  -- PSLLW/PSLLD/PSLLQ, PSRLW/PSRLD/PSRLQ, PSRAW/PSRAD/PSRAQ;
+  -- AMD APM Vol. 4 corresponding encoding tables (e.g. PSLLW pp. 652–654).
+  | 0x71 => .byPfx .nm (.grp .nm .nm (evexBW (.vpsrl 16) [vecV x, vecM x, I b]) .nm
+                        (evexBW (.vpsra 16) [vecV x, vecM x, I b]) .nm
+                        (evexBW (.vpsll 16) [vecV x, vecM x, I b]) .nm) .nm .nm
+  | 0x72 => .byPfx .nm (.grp .nm .nm (evexD (.vpsrl 32) [vecV x, vecM x, I b]) .nm
+                        (evexDQ .vpsra [vecV x, vecM x, I b]) .nm
+                        (evexD (.vpsll 32) [vecV x, vecM x, I b]) .nm) .nm .nm
+  | 0x73 => .byPfx .nm (.grp .nm .nm (evexQ (.vpsrl 64) [vecV x, vecM x, I b])
+                        (evexL [.avx512bw] (avx .vpsrldq [vecV x, vecM x, I b]))
+                        .nm .nm (evexQ (.vpsll 64) [vecV x, vecM x, I b])
+                        (evexL [.avx512bw] (avx .vpslldq [vecV x, vecM x, I b]))) .nm .nm
   | 0x10 => .byPfx (evexMov .vmovups true) .nm .nm .nm
   | 0x11 => .byPfx (evexMov .vmovups false) .nm .nm .nm
   | 0x28 => .byPfx (evexMov .vmovaps true) .nm .nm .nm
   | 0x29 => .byPfx (evexMov .vmovaps false) .nm .nm .nm
+  | 0x2B =>
+    let e := .byMod (evexL [] (avx .vmovntps [vecM x, vecR x])) (.ud [])
+    .byPfx (.byW e (.invalid e)) .nm .nm .nm
   | 0x63 => .byPfx .nm (evexBW .vpacksswb) .nm .nm
   | 0x64 => .byPfx .nm (evexBW (.vpcmpgt 8) toK mm) .nm .nm
   | 0x65 => .byPfx .nm (evexBW (.vpcmpgt 16) toK mm) .nm .nm
@@ -1023,6 +1191,9 @@ def evex0F : Nat → Entry
   | 0xE7 =>
     let e := .byMod (evexL [] (avx .vmovntdq [vecM x, vecR x])) (.ud [])
     .byPfx .nm (.byW e (.invalid e)) .nm .nm
+  | 0xC5 =>
+    let e := avx (.vpextr 16) [G d, vecU dq, I b]
+    .byPfx .nm (evex128 (needs .avx512bw (.byMod (.invalid e) e))) .nm .nm
   | 0xE8 => .byPfx .nm (evexBW (.vpsubs 8)) .nm .nm
   | 0xE9 => .byPfx .nm (evexBW (.vpsubs 16)) .nm .nm
   | 0xEA => .byPfx .nm (evexBW (.vpmins 16)) .nm .nm
@@ -1055,8 +1226,71 @@ a vector register, with features `fs`. -/
 def evexBcst (m : AvxMn) (s : Sz) (n : Nat) (fs : List Feat) : Entry :=
   evexL fs (avx m [vecR x, vecM s] { masking := .full, disp8 := .scalar n })
 
+/-- EVEX packed widening moves: narrow tuple memory sizes, with XMM sources
+except the 512-bit result of a twofold widening, which uses YMM. Memory displacement
+scales by the source byte extent, not destination width. WIG except the dword-to-
+quadword forms (W0); reserved vvvv.
+SDM Vol. 2B PMOVSX/PMOVZX (Half/Quarter/Eighth Mem tuples); AMD APM Vol. 4,
+the same encoding tables, pp. 563–598. Only byte-to-word needs AVX512BW; other
+forms need AVX512F (and VL below 512), as checked by the common EVEX path. -/
+def evexPmov (m : AvxMn) (bw : Bool) (s128 s256 s512 : Sz) (n : Nat) (w0 : Bool := false) : Entry :=
+  let row (s reg : Sz) (bytes : Nat) :=
+    let a : Attr := { masking := .full, disp8 := .scalar bytes }
+    .byMod (avx m [vecR x, vecM s] a) (avx m [vecR x, vecM reg] a)
+  let e := evexL (if bw then [.avx512bw] else [])
+    (.byL (row s128 dq n) (row s256 dq (2*n))
+      (row s512 (if n = 8 then qq else dq) (4*n)) (.invalid (row s512 dq (4*n))))
+  if w0 then .byW e (.invalid e) else e
+
 /-- The EVEX map `0F 38` (`EVEX.mmm = 2`). -/
 def evex0F38 : Nat → Entry
+  | 0x90 => .byPfx .nm (.byW (gatherEntry .vpgatherdd 32 32 true)
+                            (gatherEntry .vpgatherdq 32 64 true)) .nm .nm
+  | 0x91 => .byPfx .nm (.byW (gatherEntry .vpgatherqd 64 32 true)
+                            (gatherEntry .vpgatherqq 64 64 true)) .nm .nm
+  | 0x92 => .byPfx .nm (.byW (gatherEntry .vgatherdps 32 32 true)
+                            (gatherEntry .vgatherdpd 32 64 true)) .nm .nm
+  | 0x93 => .byPfx .nm (.byW (gatherEntry .vgatherqps 64 32 true)
+                            (gatherEntry .vgatherqpd 64 64 true)) .nm .nm
+  | 0x20 => .byPfx .nm (evexPmov .vpmovsxbw true q dq qq 8) .nm .nm
+  | 0x21 => .byPfx .nm (evexPmov .vpmovsxbd false d q dq 4) .nm .nm
+  | 0x22 => .byPfx .nm (evexPmov .vpmovsxbq false w d q 2) .nm .nm
+  | 0x23 => .byPfx .nm (evexPmov .vpmovsxwd false q dq qq 8) .nm .nm
+  | 0x24 => .byPfx .nm (evexPmov .vpmovsxwq false d q dq 4) .nm .nm
+  | 0x25 => .byPfx .nm (evexPmov .vpmovsxdq false q dq qq 8 true) .nm .nm
+  | 0x30 => .byPfx .nm (evexPmov .vpmovzxbw true q dq qq 8) .nm .nm
+  | 0x31 => .byPfx .nm (evexPmov .vpmovzxbd false d q dq 4) .nm .nm
+  | 0x32 => .byPfx .nm (evexPmov .vpmovzxbq false w d q 2) .nm .nm
+  | 0x33 => .byPfx .nm (evexPmov .vpmovzxwd false q dq qq 8) .nm .nm
+  | 0x34 => .byPfx .nm (evexPmov .vpmovzxwq false d q dq 4) .nm .nm
+  | 0x35 => .byPfx .nm (evexPmov .vpmovzxdq false q dq qq 8 true) .nm .nm
+  -- Floating permutations: SDM Vol.2C pp.5-505–528, 5-535–540;
+  -- APM Vol.4 pp.1346–1349, 1362–1372, 1379–1382. F(+VL), E4NF.
+  | 0x0C => .byPfx .nm (evexD .vpermilps) .nm .nm
+  | 0x0D => .byPfx .nm (evexQ .vpermilpd) .nm .nm
+  | 0x16 =>
+    let e := .byW (evexD .vpermps) (evexQ .vpermpd)
+    .byPfx .nm (.byL (.invalid e) e e (.invalid e)) .nm .nm
+  | 0x77 => .byPfx .nm (.byW (evexD .vpermi2ps) (evexQ .vpermi2pd)) .nm .nm
+  | 0x7F => .byPfx .nm (.byW (evexD .vpermt2ps) (evexQ .vpermt2pd)) .nm .nm
+  -- Cross-lane permutations (SDM Vol. 2C; APM Vol. 4 pp. 1340–1345, 1373–1378).
+  | 0x36 =>
+    let e := .byW (evexD .vpermd) (evexQ .vpermq)
+    .byPfx .nm (.byL (.invalid e) e e (.invalid e)) .nm .nm
+  -- SDM Vol.2C pp.5-498–510, 5-533–540; APM Vol.4 pp.1338–1353, 1375–1388.
+  | 0x8D => .byPfx .nm (.byW (evexL [.avx512vbmi] (avx .vpermb [vecR x, vecV x, vecM x] mz))
+                                    (evexBW .vpermw)) .nm .nm
+  -- The APM B/W two-table prose says m32bcst but its encoding tables require b=0.
+  -- The SDM allows no broadcast (E4NF.nb). EVEX.b=1 stays explicitly not modelled
+  -- until the AMD disagreement is resolved; Attr.bcst remains none.
+  | 0x75 => .byPfx .nm (.byW (evexL [.avx512vbmi] (avx .vpermi2b [vecR x, vecV x, vecM x]
+                                    { mz with unsettledBcst := true }))
+                                    (evexBW .vpermi2w (a := { mz with unsettledBcst := true }))) .nm .nm
+  | 0x7D => .byPfx .nm (.byW (evexL [.avx512vbmi] (avx .vpermt2b [vecR x, vecV x, vecM x]
+                                    { mz with unsettledBcst := true }))
+                                    (evexBW .vpermt2w (a := { mz with unsettledBcst := true }))) .nm .nm
+  | 0x76 => .byPfx .nm (.byW (evexD .vpermi2d) (evexQ .vpermi2q)) .nm .nm
+  | 0x7E => .byPfx .nm (.byW (evexD .vpermt2d) (evexQ .vpermt2q)) .nm .nm
   | 0x00 => .byPfx .nm (evexBW .vpshufb) .nm .nm
   | 0x18 => .byPfx .nm (.byW (evexBcst .vbroadcastss d 4 []) (.invalid (evexBcst .vbroadcastss d 4 []))) .nm .nm
   -- `VPTESTM*` with `66`, `VPTESTNM*` with `F3`
@@ -1103,6 +1337,44 @@ def evex0F38 : Nat → Entry
 
 /-- The EVEX map `0F 3A` (`EVEX.mmm = 3`). -/
 def evex0F3A : Nat → Entry
+  -- SDM VPERMILPS/PD and VPERMPD; APM pp.1362–1370: F(+VL), E4NF.
+  | 0x04 => .byPfx .nm (evexD .vpermilps [vecR x, vecM x, I b]) .nm .nm
+  | 0x05 => .byPfx .nm (evexQ .vpermilpd [vecR x, vecM x, I b]) .nm .nm
+  | 0x01 =>
+    let e := evexQ .vpermpd [vecR x, vecM x, I b]
+    .byPfx .nm (.byL (.invalid e) e e (.invalid e)) .nm .nm
+  -- SDM Vol.2C pp.5-750–754; APM Vol.4 pp.1739–1746: 256/512 only, E4NF.
+  | 0x23 =>
+    let e := .byW (evexD .vshuff32x4 [vecR x, vecV x, vecM x, I b])
+                  (evexQ .vshuff64x2 [vecR x, vecV x, vecM x, I b])
+    .byPfx .nm (.byL (.invalid e) e e (.invalid e)) .nm .nm
+  | 0x43 =>
+    let e := .byW (evexD .vshufi32x4 [vecR x, vecV x, vecM x, I b])
+                  (evexQ .vshufi64x2 [vecR x, vecV x, vecM x, I b])
+    .byPfx .nm (.byL (.invalid e) e e (.invalid e)) .nm .nm
+  -- SDM PALIGNR, pp.4-216–219; APM Vol.4 PALIGNR/VPALIGNR, pp.419–421.
+  | 0x0F => .byPfx .nm (evexBW .vpalignr [vecR x, vecV x, vecM x, I b]) .nm .nm
+  -- Immediate quadword permutation is EVEX.256/512 only, W1, with broadcast.
+  | 0x00 =>
+    let e := evexQ .vpermq [vecR x, vecM x, I b]
+    .byPfx .nm (.byL (.invalid e) e e (.invalid e)) .nm .nm
+  -- SDM Vol. 2B PEXTRB/D/Q and PEXTRW; AMD APM Vol. 4 pp. 475–486.
+  -- Scalar extracts use AVX512F plus BW/DQ, but do not require VL despite EVEX.128.
+  | 0x14 => .byPfx .nm (evex128 (needs .avx512bw
+      (avx (.vpextr 8) [ER d b, vecR dq, I b] { disp8 := .scalar 1 }))) .nm .nm
+  | 0x15 => .byPfx .nm (evex128 (needs .avx512bw
+      (avx (.vpextr 16) [ER d w, vecR dq, I b] { disp8 := .scalar 2 }))) .nm .nm
+  | 0x16 => .byPfx .nm (evex128 (needs .avx512dq
+      (.byW (avx (.vpextr 32) [E d, vecR dq, I b] s4)
+            (avx (.vpextr 64) [E q, vecR dq, I b] s8)))) .nm .nm
+  | 0x18 => .byPfx .nm (evexInsert .vinsertf 128) .nm .nm
+  | 0x19 => .byPfx .nm (evexExtract .vextractf 128) .nm .nm
+  | 0x1A => .byPfx .nm (evexInsert .vinsertf 256) .nm .nm
+  | 0x1B => .byPfx .nm (evexExtract .vextractf 256) .nm .nm
+  | 0x38 => .byPfx .nm (evexInsert .vinserti 128) .nm .nm
+  | 0x39 => .byPfx .nm (evexExtract .vextracti 128) .nm .nm
+  | 0x3A => .byPfx .nm (evexInsert .vinserti 256) .nm .nm
+  | 0x3B => .byPfx .nm (evexExtract .vextracti 256) .nm .nm
   | 0x1E => .byPfx .nm (.byW (evexL [] (avx (.vpcmp 32 true) [kR, vecV x, vecM x, I b] (mmb 32)))
                             (evexL [] (avx (.vpcmp 64 true) [kR, vecV x, vecM x, I b] (mmb 64)))) .nm .nm
   | 0x1F => .byPfx .nm (.byW (evexL [] (avx (.vpcmp 32 false) [kR, vecV x, vecM x, I b] (mmb 32)))

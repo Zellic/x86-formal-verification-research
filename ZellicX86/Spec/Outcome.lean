@@ -78,7 +78,17 @@ inductive KillCause
   | kernel
   /-- A signal the process sent itself (`kill`, `tkill`, `tgkill` to its own process or thread). -/
   | self
+  /-- The `SIGBUS` the kernel sent because it could not allocate the huge page at the process's first access to its
+  page at `a` (`mm/hugetlb.c` `hugetlb_no_page`: `alloc_hugetlb_folio` fails, `vmf_error` gives `VM_FAULT_SIGBUS`;
+  `hugeFault`). Kept apart from `exception` (`#PF` at `a`, which it also is) so that a statement can admit this end, a
+  refusal of the system's, without admitting a `SIGBUS` beyond a file's end. -/
+  | hugeFault (a : Addr)
   deriving Repr
+
+/-- Whether `c` is a refused huge page's `SIGBUS` (`KillCause.hugeFault`). -/
+def KillCause.isHugeFault : KillCause → Bool
+  | .hugeFault _ => true
+  | _ => false
 
 /-- The system call that ended the process. `exit(2)` ends the calling thread
 (`kernel/exit.c` `do_exit`), and the process with it when that thread is its last;

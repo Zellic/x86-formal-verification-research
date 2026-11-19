@@ -102,6 +102,7 @@ def Decode.Opd.width : Opd → Nat
   | .rel _ => 64
   | .bcst _ w => w
   | .st _ => 80
+  | .vsib m => m.dataWidth
 
 /-- Element `i` of `k` bits of `x`: bits `k·i + k − 1` to `k·i` (SDM Vol. 1, 4.6 "Packed SIMD Data
 Types": element 0 is the least significant). -/

@@ -177,16 +177,6 @@ Type1.SSE2 (Table 2-18); AMD APM Vol. 4, MOVNTDQ/VMOVNTDQ, pp. 318–320.
 The non-temporal hint's ordering across threads is not modelled (`Sem.movntps`). -/
 def Sem.movntdq (i : Inst) : Prog Ctl := moveAligned i
 
-/-! `PMINUD` (SSE4.1) -/
-
-/-- Legacy `PMINUD`: the lesser unsigned doubleword of each source pair, preserving
-the destination's bits above 127 and all flags. The decoder checks SSE4.1; memory
-uses exception type 4 alignment, relaxed by AMD's misaligned SSE mode.
-SDM Vol. 2B, PMINUD/PMINUQ, Operation and Table 2-21;
-AMD APM Vol. 4, PMINUD/VPMINUD, pp. 553–555. -/
-def Sem.pminud (prof : Profile) (i : Inst) : Prog Ctl := packedOp prof i fun a b =>
-  ofDwords fun j => if (lane 32 a j).toNat < (lane 32 b j).toNat then lane 32 a j else lane 32 b j
-
 /-- `MOVD`: 32 bits between an `XMM` register and a general register or memory (SDM Vol. 2,
 "MOVD/MOVQ"). -/
 def Sem.movd (i : Inst) : Prog Ctl := moveBits 32 i
@@ -195,7 +185,8 @@ def Sem.movd (i : Inst) : Prog Ctl := moveBits 32 i
 def Sem.movq (i : Inst) : Prog Ctl := moveBits 64 i
 
 /-- `MOVHPS`: the high quadword of an `XMM` register from 8 bytes of memory, the low one
-unchanged, or to memory (SDM Vol. 2, "MOVHPS"; exception type 5). -/
+unchanged, or to memory (SDM Vol. 2, "MOVHPS", type 5; AMD APM Vol. 4,
+MOVHPS/VMOVHPS, pp. 306–307). -/
 def Sem.movhps (i : Inst) : Prog Ctl :=
   match i.ops with
   | [.xmm n, s] => do
@@ -210,7 +201,8 @@ def Sem.movhps (i : Inst) : Prog Ctl :=
   | _ => formNotModelled i
 
 /-- `MOVLPS`: the low quadword of an `XMM` register from 8 bytes of memory, the high one
-unchanged, or to memory (SDM Vol. 2, "MOVLPS"; exception type 5). -/
+unchanged, or to memory (SDM Vol. 2, "MOVLPS", type 5; AMD APM Vol. 4,
+MOVLPS/VMOVLPS, pp. 312–313). -/
 def Sem.movlps (i : Inst) : Prog Ctl :=
   match i.ops with
   | [.xmm n, s] => do
@@ -312,7 +304,7 @@ def Sem.shufpd (prof : Profile) (i : Inst) : Prog Ctl :=
   | _ => formNotModelled i
 
 /-- `MOVMSKPS`: bit `j` of the general register is the sign bit of doubleword `j`, the other bits 0
-(SDM Vol. 2, "MOVMSKPS"). -/
+(SDM Vol. 2, "MOVMSKPS"; AMD APM Vol. 4, MOVMSKPS/VMOVMSKPS, pp. 316–317). -/
 def Sem.movmskps (i : Inst) : Prog Ctl :=
   match i.ops with
   | [d, s] => do
@@ -322,7 +314,7 @@ def Sem.movmskps (i : Inst) : Prog Ctl :=
   | _ => formNotModelled i
 
 /-- `MOVMSKPD`: bit `j` of the general register is the sign bit of quadword `j`, the other bits 0
-(SDM Vol. 2, "MOVMSKPD"). -/
+(SDM Vol. 2, "MOVMSKPD"; AMD APM Vol. 4, MOVMSKPD/VMOVMSKPD, pp. 314–315). -/
 def Sem.movmskpd (i : Inst) : Prog Ctl :=
   match i.ops with
   | [d, s] => do
@@ -334,7 +326,7 @@ def Sem.movmskpd (i : Inst) : Prog Ctl :=
 /-- A scalar move of the low `w` bits (`MOVSS`, `MOVSD`): between two registers only the low `w`
 bits of the destination change; a load from memory clears the destination's bits 127 to `w`, a store
 writes `w` bits (SDM Vol. 2, "MOVSS", "MOVSD": legacy forms keep bits `MAXVL-1:128`; exception
-type 5). -/
+type 5; AMD APM Vol. 4, MOVSD/VMOVSD, pp. 332–334, and MOVSS/VMOVSS). -/
 def scalarMove (w : Nat) (i : Inst) : Prog Ctl :=
   match i.ops with
   | [.xmm d, .xmm s] => do
@@ -372,9 +364,11 @@ def Sem.dup (misalignSse : Bool) (double high : Bool) (i : Inst) : Prog Ctl :=
     done
   | _ => formNotModelled i
 
-/-- `MOVLPD`: as `MOVLPS` (SDM Vol. 2, "MOVLPD"). -/
+/-- `MOVLPD`: as `MOVLPS` (SDM Vol. 2, "MOVLPD"; AMD APM Vol. 4,
+MOVLPD/VMOVLPD, pp. 310–311). -/
 def Sem.movlpd (i : Inst) : Prog Ctl := Sem.movlps i
-/-- `MOVHPD`: as `MOVHPS` (SDM Vol. 2, "MOVHPD"). -/
+/-- `MOVHPD`: as `MOVHPS` (SDM Vol. 2, "MOVHPD"; AMD APM Vol. 4,
+MOVHPD/VMOVHPD, pp. 304–305). -/
 def Sem.movhpd (i : Inst) : Prog Ctl := Sem.movhps i
 
 /-- `PADDB`: bytewise sums, wrapping (SDM Vol. 2, "PADDB/PADDW/PADDD/PADDQ"). -/
@@ -419,12 +413,36 @@ def Sem.pcmpgtw (prof : Profile) (i : Inst) : Prog Ctl := packedOp prof i fun a 
 /-- `PCMPGTD` (SDM Vol. 2, "PCMPGTB/PCMPGTW/PCMPGTD"). -/
 def Sem.pcmpgtd (prof : Profile) (i : Inst) : Prog Ctl := packedOp prof i fun a b =>
   ofDwords fun j => if (lane 32 b j).slt (lane 32 a j) then BitVec.allOnes 32 else 0
-/-- `PMINUB`: the unsigned minimum of each byte (SDM Vol. 2, "PMINUB/PMINUW"). -/
-def Sem.pminub (prof : Profile) (i : Inst) : Prog Ctl := packedOp prof i fun a b =>
-  ofBytes fun j => if lane 8 a j ≤ lane 8 b j then lane 8 a j else lane 8 b j
-/-- `PMAXUB`: the unsigned maximum of each byte (SDM Vol. 2, "PMAXUB/PMAXUW"). -/
-def Sem.pmaxub (prof : Profile) (i : Inst) : Prog Ctl := packedOp prof i fun a b =>
-  ofBytes fun j => if lane 8 a j ≥ lane 8 b j then lane 8 a j else lane 8 b j
+/-- Legacy `PMINUB/UW/UD`: per-element unsigned minimum at `e` = 8/16/32.
+Bits above 127 and flags are preserved. Memory uses Type 4 alignment, relaxed by AMD's
+MXCSR.MM. SDM Vol. 2B, PMIN*/PMAX*, pp. 4-316–349, Type 4 Table 2-21;
+AMD APM Vol. 4, corresponding PMIN*/PMAX* pages, pp. 521–560. -/
+def Sem.pminu (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl :=
+  if e = 8 then packedOp prof i fun a b =>
+    ofBytes fun j => if lane 8 a j ≤ lane 8 b j then lane 8 a j else lane 8 b j
+  else packedOp prof i fun a b =>
+    ofElems 128 e fun j => if lane e a j ≤ lane e b j then lane e a j else lane e b j
+/-- Legacy `PMAXUB/UW/UD`: per-element unsigned maximum at `e` = 8/16/32.
+Bits above 127 and flags are preserved. Memory uses Type 4 alignment, relaxed by AMD's
+MXCSR.MM. SDM Vol. 2B, PMIN*/PMAX*, pp. 4-316–349, Type 4 Table 2-21;
+AMD APM Vol. 4, corresponding PMIN*/PMAX* pages, pp. 521–560. -/
+def Sem.pmaxu (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl :=
+  if e = 8 then packedOp prof i fun a b =>
+    ofBytes fun j => if lane 8 a j ≥ lane 8 b j then lane 8 a j else lane 8 b j
+  else packedOp prof i fun a b =>
+    ofElems 128 e fun j => if lane e a j ≤ lane e b j then lane e b j else lane e a j
+/-- Legacy `PMINSB/SW/SD`: per-element signed minimum at `e` = 8/16/32.
+Bits above 127 and flags are preserved. Memory uses Type 4 alignment, relaxed by AMD's
+MXCSR.MM. SDM Vol. 2B, PMIN*/PMAX*, pp. 4-316–349, Type 4 Table 2-21;
+AMD APM Vol. 4, corresponding PMIN*/PMAX* pages, pp. 521–560. -/
+def Sem.pmins (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl := packedOp prof i fun a b =>
+  ofElems 128 e fun j => if (lane e a j).sle (lane e b j) then lane e a j else lane e b j
+/-- Legacy `PMAXSB/SW/SD`: per-element signed maximum at `e` = 8/16/32.
+Bits above 127 and flags are preserved. Memory uses Type 4 alignment, relaxed by AMD's
+MXCSR.MM. SDM Vol. 2B, PMIN*/PMAX*, pp. 4-316–349, Type 4 Table 2-21;
+AMD APM Vol. 4, corresponding PMIN*/PMAX* pages, pp. 521–560. -/
+def Sem.pmaxs (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl := packedOp prof i fun a b =>
+  ofElems 128 e fun j => if (lane e a j).sle (lane e b j) then lane e b j else lane e a j
 
 /-- `PUNPCKLBW` (`interleave`). -/
 def Sem.punpcklbw (prof : Profile) (i : Inst) : Prog Ctl := packedOp prof i fun a b => ofBytes (interleave 8 0 a b)
@@ -921,13 +939,44 @@ def Sem.pcmpistrm (i : Inst) : Prog Ctl :=
     done
   | _ => formNotModelled i
 
+/-- Packed widening moves `PMOVSX*`/`PMOVZX*` and their VEX forms: extend the low
+`dst.width / targetBits` source elements, each of `sourceBits` bits, with sign extension
+when `signed`, otherwise zero extension (Intel SDM Vol. 2B, "PMOVSX"/"PMOVZX", Operation;
+AMD APM Vol. 4, `(V)PMOVSXBW/BD/BQ/WD/WQ/DQ` and `(V)PMOVZXBW/BD/BQ/WD/WQ/DQ`).
+Read only the narrow source width, including memory; these type-5 instructions impose no
+16-byte alignment check. Flags and MXCSR are unchanged. `writeOp` preserves the legacy
+upper bits and clears bits above a VEX destination's 128/256 bits. -/
+def Sem.pmovx (signed : Bool) (sourceBits targetBits : Nat) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [dst, src] => do
+    let width := dst.width
+    let value ← readOp (width / targetBits * sourceBits) src
+    let result := ofElems width targetBits fun j =>
+      let x := elem sourceBits value j
+      if signed then BitVec.signExtend targetBits x else x.setWidth targetBits
+    writeOp dst result
+    done
+  | _ => formNotModelled i
+
 /-- Execute legacy SSE instruction `i` of mnemonic `m` on processor `prof`, with `rip` already
 advanced past it. -/
 def execSse (prof : Profile) (m : SseMn) (i : Inst) : Prog Ctl :=
   match m with
+  | .pmovsxbw => Sem.pmovx true 8 16 i
+  | .pmovsxbd => Sem.pmovx true 8 32 i
+  | .pmovsxbq => Sem.pmovx true 8 64 i
+  | .pmovsxwd => Sem.pmovx true 16 32 i
+  | .pmovsxwq => Sem.pmovx true 16 64 i
+  | .pmovsxdq => Sem.pmovx true 32 64 i
+  | .pmovzxbw => Sem.pmovx false 8 16 i
+  | .pmovzxbd => Sem.pmovx false 8 32 i
+  | .pmovzxbq => Sem.pmovx false 8 64 i
+  | .pmovzxwd => Sem.pmovx false 16 32 i
+  | .pmovzxwq => Sem.pmovx false 16 64 i
+  | .pmovzxdq => Sem.pmovx false 32 64 i
   | .movups => Sem.movups i | .movaps => Sem.movaps i | .movdqa => Sem.movdqa i
   | .movdqu => Sem.movdqu i | .movd => Sem.movd i | .movq => Sem.movq i
-  | .movntps => Sem.movntps i | .movntdq => Sem.movntdq i | .pminud => Sem.pminud prof i
+  | .movntps => Sem.movntps i | .movntdq => Sem.movntdq i
   | .movhps => Sem.movhps i | .movlps => Sem.movlps i | .movlhps => Sem.movlhps i
   | .movhlps => Sem.movhlps i
   | .pxor => Sem.pxor prof i | .por => Sem.por prof i | .pand => Sem.pand prof i | .pandn => Sem.pandn prof i
@@ -935,7 +984,9 @@ def execSse (prof : Profile) (m : SseMn) (i : Inst) : Prog Ctl :=
   | .psubb => Sem.psubb prof i | .psubw => Sem.psubw prof i | .psubd => Sem.psubd prof i | .psubq => Sem.psubq prof i
   | .pcmpeqb => Sem.pcmpeqb prof i | .pcmpeqw => Sem.pcmpeqw prof i | .pcmpeqd => Sem.pcmpeqd prof i
   | .pcmpgtb => Sem.pcmpgtb prof i | .pcmpgtw => Sem.pcmpgtw prof i | .pcmpgtd => Sem.pcmpgtd prof i
-  | .pminub => Sem.pminub prof i | .pmaxub => Sem.pmaxub prof i | .pmovmskb => Sem.pmovmskb i
+  | .pminu e => Sem.pminu prof e i | .pmaxu e => Sem.pmaxu prof e i
+  | .pmins e => Sem.pmins prof e i | .pmaxs e => Sem.pmaxs prof e i
+  | .pmovmskb => Sem.pmovmskb i
   | .psrlw => Sem.psrlw prof i | .psrld => Sem.psrld prof i | .psrlq => Sem.psrlq prof i
   | .psllw => Sem.psllw prof i | .pslld => Sem.pslld prof i | .psllq => Sem.psllq prof i
   | .psraw => Sem.psraw prof i | .psrad => Sem.psrad prof i | .psrldq => Sem.psrldq prof i

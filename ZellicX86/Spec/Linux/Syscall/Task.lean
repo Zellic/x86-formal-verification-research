@@ -167,7 +167,8 @@ limit above the hard one is `EINVAL`, a descriptor limit whose hard limit exceed
 hard limit without `CAP_SYS_RESOURCE`, is among its refusals). On success the limit is set. The model
 reads the limits where the kernel does: `RLIMIT_STACK` at every stack growth (`stackLimitPages`),
 `RLIMIT_NOFILE` whenever a descriptor is allocated (`allocFd`, `dupTo`, `fcntl(F_DUPFD)`), `RLIMIT_FSIZE`
-in `write` and `writev`; the memory limits only through the refusals `Request.memFail` stands for. The
+in `write` and `writev`, `RLIMIT_AS` and `RLIMIT_DATA` in `brk`, `mmap`, `mremap` and the stack's growth
+(`Mm.dataFits`, `mayExpandVm`). The
 CPU time limit's `SIGXCPU` and `SIGKILL` (`RLIMIT_CPU`; `kernel/time/posix-cpu-timers.c`) depend on time,
 which the model does not have: they are external signals (`EnvEvent.signal`). -/
 def setRlimit (s : State) (res : Fin 16) (lim : Rlimit) : Req (Except Nat State) := do

@@ -16,6 +16,8 @@ size else doubleword, `y` doubleword or quadword (by REX.W), `dq` 128 bits, `x` 
 length of a VEX or EVEX instruction (128, 256 or 512 bits by `VEX.L` or `EVEX.L'L`; SDM: "x"
 and "qq"). -/
 inductive Sz | b | w | d | q | v | z | y | dq | x
+  /-- A fixed 256-bit source (EVEX widening to 512 bits); `x` follows the destination VL. -/
+  | qq
 
 /-- Operand codes of SDM Vol. 2 A.2.1, plus the fixed operands the tables name. -/
 inductive OS
@@ -31,7 +33,7 @@ inductive OS
   | Ibs (s : Sz)
   /-- `J`: relative offset of size `s`, added to the address of the next instruction. -/
   | J (s : Sz)
-  /-- `M`: ModRM r/m, memory only; no access width (`lea`). -/
+  /-- `M`: ModRM r/m, memory only; no fixed access width (`lea`, XSAVE-family areas whose extent depends on the profile and mask). -/
   | M
   /-- ModRM r/m, a general register of size `r` or memory of size `m` (SDM: "Ry/Mw", the source
   of `PINSRW`). -/
@@ -66,6 +68,10 @@ inductive OS
   /-- A VEX or EVEX instruction's vector register in ModRM r/m (with EVEX one of 32, by
   `EVEX.X`), or memory of size `s` (SDM: `W`). -/
   | vecM (s : Sz)
+  /-- A VSIB memory operand: signed index elements of `indexBits` bits in a vector
+  register of size `indexSize`, loading elements of `dataSize`. SDM Vol. 2C gathers;
+  AMD APM Vol. 4 §1.3. This is distinct from a scalar SIB/GPR index. -/
+  | vsib (indexBits : Nat) (indexSize dataSize : Sz)
   /-- A VEX or EVEX instruction's vector register in ModRM r/m, register only (SDM: `U`). -/
   | vecU (s : Sz)
   /-- The vector register `VEX.vvvv` names (SDM: `H`); with EVEX one of 32 (`EVEX.V'`). -/
@@ -98,13 +104,14 @@ inductive SseMn
   | movups | movaps | movdqa | movdqu | movd | movq | movntps | movntdq
   | movhps | movlps | movlhps | movhlps
   | pxor | por | pand | pandn | paddb | paddw | paddd | paddq | psubb | psubw | psubd | psubq
-  | pcmpeqb | pcmpeqw | pcmpeqd | pcmpgtb | pcmpgtw | pcmpgtd | pminub | pmaxub | pmovmskb
+  | pcmpeqb | pcmpeqw | pcmpeqd | pcmpgtb | pcmpgtw | pcmpgtd | pmovmskb
   | psrlw | psrld | psrlq | psllw | pslld | psllq | psraw | psrad | psrldq | pslldq
   | pshufd | pshuflw | pshufhw | pinsrw | pextrw
   | pinsrb | pinsrd | pinsrq | pextrb | pextrd | pextrq
   | punpcklbw | punpcklwd | punpckldq | punpcklqdq | punpckhbw | punpckhwd | punpckhdq
   | punpckhqdq | xorps
-  | pshufb | palignr | pblendw | pminud | sha256rnds2 | sha256msg1 | sha256msg2
+  | pshufb | palignr | pblendw | sha256rnds2 | sha256msg1 | sha256msg2
+  | pminu (e : Nat) | pmaxu (e : Nat) | pmins (e : Nat) | pmaxs (e : Nat)
   | pavgb | pavgw | psadbw
   | pmuldq | pmulhw | pmulhuw | pmullw | pmaddwd | pmaddubsw | pmulhrsw
   | pmuludq | psubusb | psubusw | packuswb | packsswb | packssdw | packusdw
@@ -115,6 +122,9 @@ inductive SseMn
   | movddup | movshdup | movsldup
   | andps | andpd | andnps | andnpd | orps | orpd | xorpd
   | unpcklps | unpcklpd | unpckhps | unpckhpd | shufps | shufpd | movmskps | movmskpd
+  -- Low packed elements widened to words, doublewords or quadwords (SDM PMOVSX/PMOVZX).
+  | pmovsxbw | pmovsxbd | pmovsxbq | pmovsxwd | pmovsxwq | pmovsxdq
+  | pmovzxbw | pmovzxbd | pmovzxbq | pmovzxwd | pmovzxwq | pmovzxdq
   deriving Repr
 
 /-- The element type of an SSE or AVX floating-point instruction, its mnemonic's suffix: packed
@@ -187,13 +197,13 @@ argument `e` stands for the SDM's forms of element size `e` bits (8, 16, 32, 64:
 with `u`, `VPCMPB` etc. without. -/
 inductive AvxMn
   | vmovdqu | vmovdqa | vmovdqu8 | vmovdqu16 | vmovdqu32 | vmovdqu64 | vmovdqa32 | vmovdqa64
-  | vmovups | vmovaps | vmovntdq
+  | vmovups | vmovaps | vmovntdq | vmovntps
   | vpxor | vpxord | vpxorq | vpor | vpord | vporq | vpand | vpandd | vpandq
   | vpandn | vpandnd | vpandnq
   | vpcmpeq (e : Nat) | vpcmpgt (e : Nat) | vpcmp (e : Nat) (u : Bool)
   | vptestm (e : Nat) | vptestnm (e : Nat)
   | vpminu (e : Nat) | vpmaxu (e : Nat) | vpmins (e : Nat) | vpmaxs (e : Nat)
-  | vpadd (e : Nat) | vpsub (e : Nat) | vpternlog (e : Nat) | vpshufb
+  | vpadd (e : Nat) | vpsub (e : Nat) | vpternlog (e : Nat) | vpshufb | vpalignr
   | vpavgb | vpavgw | vpsadbw
   | vpmuldq | vpmulhw | vpmulhuw | vpmullw | vpmaddwd | vpmaddubsw | vpmulhrsw
   | vpsubus (e : Nat) | vpmuludq | vpackuswb | vpacksswb | vpackssdw | vpackusdw
@@ -204,6 +214,8 @@ inductive AvxMn
   | vpinsr (e : Nat) | vpextr (e : Nat)
   | vpunpcklqdq | vpunpckhqdq
   | vinserti128 | vextracti128 | vinsertf128 | vextractf128
+  | vextracti (e n : Nat) | vextractf (e n : Nat)
+  | vinserti (e n : Nat) | vinsertf (e n : Nat)
   | vmovupd | vmovapd | vmovss | vmovsd | vandps | vandpd | vandnps | vandnpd | vorps | vorpd
   | vxorps | vxorpd | vunpcklps | vunpcklpd | vunpckhps | vunpckhpd | vshufps | vshufpd
   | vmovddup | vmovshdup | vmovsldup
@@ -211,6 +223,18 @@ inductive AvxMn
   | kmov (e : Nat) | kortest (e : Nat) | ktest (e : Nat)
   | kand (e : Nat) | kandn (e : Nat) | kor (e : Nat) | kxnor (e : Nat) | kxor (e : Nat)
   | knot (e : Nat)
+  -- Low packed elements widened to words, doublewords or quadwords (SDM PMOVSX/PMOVZX).
+  | vpmovsxbw | vpmovsxbd | vpmovsxbq | vpmovsxwd | vpmovsxwq | vpmovsxdq
+  | vpmovzxbw | vpmovzxbd | vpmovzxbq | vpmovzxwd | vpmovzxwq | vpmovzxdq
+  | vpshufd | vpshuflw | vpshufhw | vpsrldq | vpslldq
+  | vpermilps | vpermilpd | vpermps | vpermpd
+  | vpermi2ps | vpermi2pd | vpermt2ps | vpermt2pd
+  | vpermq | vpermd | vperm2i128
+  | vpermt2d | vpermi2d
+  | vpermb | vpermw | vpermi2b | vpermi2w | vpermi2q | vpermt2b | vpermt2w | vpermt2q
+  | vshufi32x4 | vshufi64x2 | vshuff32x4 | vshuff64x2
+  | vpgatherdd | vpgatherdq | vpgatherqd | vpgatherqq
+  | vgatherdps | vgatherdpd | vgatherqps | vgatherqpd
   deriving Repr
 
 /-- Mnemonics of the string instructions and of `CLD`/`STD`, which set their direction. -/
@@ -247,6 +271,7 @@ inductive Mn
   | fp (m : FpMn)
   | avx (m : AvxMn)
   | x87 (m : X87Mn)
+  | xsave | xrstor | xsavec
   deriving Repr
 
 /-- Which opmask an EVEX instruction accepts (SDM Vol. 2, 2.7.4, Table 2-42): none (`EVEX.aaa`
@@ -276,18 +301,25 @@ structure Attr where
   strZ : Bool := false
   /-- How an EVEX instruction takes an opmask in `EVEX.aaa` and `EVEX.z`. -/
   masking : Masking := .none
+  /-- Gather constraints: destination/index (and VEX vector mask) are distinct;
+  EVEX requires a nonzero opmask. SDM Vol. 2C gathers; APM Vol. 4 gather exceptions. -/
+  gather : Bool := false
   /-- The factor `N` of an EVEX instruction's compressed 8-bit displacement. -/
   disp8 : Disp8 := .full
   /-- An EVEX instruction that broadcasts its memory source with `EVEX.b`, with elements of
   `some e` bits (the "Full" tuple type of a load-and-operate instruction on doublewords or
-  quadwords, SDM Vol. 2, 2.7.5, Table 2-36; 2.7.7). `none`: `EVEX.b` raises `#UD` (Table 2-43,
+  quadwords, SDM Vol. 2, 2.7.5, Table 2-36; 2.7.7). `none`: `EVEX.b` raises `#UD`, unless `unsettledBcst` applies (Table 2-43,
   the instruction classes of Table 2-37). -/
   bcst : Option Nat := none
+  /-- Memory EVEX.b=1 is unsettled rather than invalid: AMD's byte/word two-table
+  permutation prose permits m32bcst but its encoding table requires b=0 (APM Vol.4
+  pp.1342–1343, 1352–1353, 1375–1376, 1385–1386). -/
+  unsettledBcst : Bool := false
 
 /-- CPU features an entry can depend on. -/
 inductive Feat
   | ssse3 | sse41 | sse42 | sha | bmi1 | bmi2 | lzcnt | avx | avx2 | avx512f | avx512bw
-  | avx512dq | avx512vl | movbe | rdtscp | sse3 | fma | cetSs | rtm | hle
+  | avx512dq | avx512vl | movbe | rdtscp | sse3 | fma | cetSs | rtm | hle | xsavec | avx512vbmi
 
 /-- Whether the CPU has feature `f`. -/
 def Feat.holds (f : Feat) (p : Features) : Bool :=
@@ -296,7 +328,7 @@ def Feat.holds (f : Feat) (p : Features) : Bool :=
   | .bmi2 => p.bmi2 | .lzcnt => p.lzcnt | .avx => p.avx | .avx2 => p.avx2
   | .avx512f => p.avx512f | .avx512bw => p.avx512bw | .avx512dq => p.avx512dq
   | .avx512vl => p.avx512vl | .movbe => p.movbe | .rdtscp => p.rdtscp | .sse3 => p.sse3 | .fma => p.fma
-  | .cetSs => p.cetSs | .rtm => p.rtm | .hle => p.hle
+  | .cetSs => p.cetSs | .rtm => p.rtm | .hle => p.hle | .xsavec => p.xsavec | .avx512vbmi => p.avx512vbmi
 
 /-- An opcode-map cell. -/
 inductive Entry
@@ -377,6 +409,24 @@ structure MemOp where
   width : Nat
   deriving Repr
 
+/-- A vector-indexed memory operand (VSIB). The base is a GPR or absent, the
+index is a vector register containing signed 32/64-bit offsets. Address-size
+truncation applies after base + scale*index + displacement; FS/GS are added as
+for scalar memory. SIB base=5/mod=0 has no base, never RIP. SDM Vol. 2C gathers;
+AMD APM Vol. 4 §1.3 "VSIB Addressing". Executed by the gathers' element loads
+(`Op.gatherLoad`); an element access that faults ends as not modelled. -/
+structure VsibOp where
+  seg : Option Seg
+  base : Option Nat
+  scale : Nat
+  disp : Nat
+  addr32 : Bool
+  indexReg : Nat
+  indexBits : Nat
+  indexWidth : Nat
+  dataWidth : Nat
+  deriving Repr
+
 /-- A decoded operand. -/
 inductive Opd
   /-- A general register. -/
@@ -400,6 +450,8 @@ inductive Opd
   | bcst (m : MemOp) (w : Nat)
   /-- The x87 register `ST(i)` (`i` < 8). -/
   | st (i : Nat)
+  /-- Memory elements addressed by a vector of signed indices, not a scalar memory read. -/
+  | vsib (m : VsibOp)
   deriving Repr
 
 /-- A repeat prefix on a string instruction: `F3` (`REP`; `REPE` on `CMPS` and `SCAS`) or

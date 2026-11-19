@@ -17,7 +17,8 @@ What it assumes (`contract`, `holds`):
 - the call follows the System V x86-64 calling convention (`sysv`: `a`, `b`, `n` in `rdi`, `rsi`, `rdx`, the
   stack aligned, the return address pushed);
 - the `n` bytes at `a` and the `n` bytes at `b` are readable memory (`reads`), and neither overlaps the return
-  address's slot (`pre`); the two strings may overlap each other or coincide, and `n` may be 0;
+  address's slot (the function's frame, `stack`: `CallOf.frameApart`); the two strings may overlap each other or
+  coincide, and `n` may be 0;
 - no one disturbs the run from outside: no signal arrives, no other agent writes the process's memory
   (`Undisturbed`, the default environment of a contract).
 It assumes nothing about the processor (`∀ prof`): the code uses only base x86-64 instructions.
@@ -38,8 +39,9 @@ address's slot (`frame s 0`: no stack frame of its own) and makes no system call
 def contract : Contract where
   conv := sysv
   reads := strings
-  writes s := [frame s 0]
-  pre s := Apart [frame s 0] (strings s)
+  stack := fun _ => 0
+  writes _ := []
+  pre _ := True
   post s X :=
     compare (X.cpu.gpr.rax.setWidth 32).toInt 0 =
       cmpBytes (readBytes s.proc.mm.mem s.cpu.gpr.rdi s.cpu.gpr.rdx.toNat)

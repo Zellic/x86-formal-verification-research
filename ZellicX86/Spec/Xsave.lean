@@ -1,9 +1,10 @@
 import ZellicX86.Spec.State
 import ZellicX86.Spec.Profile
 /-!
-# The `XSAVE` area
+# Standard and compacted XSAVE areas
 
-The area `XSAVE` writes and `XRSTOR` reads, in the standard format (SDM Vol. 1, ch. 13 "Managing
+The area `XSAVE` writes and `XRSTOR` reads in standard format, and the compacted
+layout `XSAVEC` writes and instruction `XRSTOR` reads (SDM Vol. 1, ch. 13 "Managing
 State Using the XSAVE Feature Set"; AMD APM Vol. 2, 11.5): its layout on a processor, what `XSAVE`
 writes there for the state components the model holds, and what `XRSTOR` and `FXRSTOR` load from
 it. The kernel puts one in every signal frame and loads it back at `rt_sigreturn`
@@ -14,7 +15,9 @@ another component (MPX, AMX tile configuration, APX) is not modelled there.
 The layout of the extended region is the processor's: component `i` lies at
 `CPUID.(EAX=0DH,ECX=i):EBX` and is `CPUID.(EAX=0DH,ECX=i):EAX` bytes long (SDM 13.4.3), as the
 kernel reads them at boot on the boot processor (`setup_xstate_cache`,
-`arch/x86/kernel/fpu/xstate.c`), here the profile's CPU 0.
+`arch/x86/kernel/fpu/xstate.c`), here the profile's CPU 0. Instruction helpers also accept the executing CPU's
+standard offsets or compacted offsets. `xCompactOffset` packs the extended
+components selected by the format bitmap, honoring their CPUID alignment flags.
 
 Where the manuals leave a byte unspecified, `XSAVE` writes a value the caller supplies (`rsv`):
 byte 5 and the upper six bytes of each x87 register's 16 (SDM Table 13-1, "Rsvd."), the four bytes
@@ -59,6 +62,18 @@ def Profile.xMaxSize (prof : Profile) : Nat :=
   match ((List.range 64).reverse.find? fun i => f.getLsbD i) with
   | some i => if i ≤ 1 then 576 else prof.xOffset i + prof.xSize i
   | none => 576
+
+/-- Offset of extended component `i` in a compacted area described by `format`, on
+logical CPU `cpu`: selected lower components packed from byte 576, respecting each
+CPUID.0DH.i:ECX[1] 64-byte alignment request (SDM Vol. 1 §13.4.3; APM Vol. 4 XRSTOR).
+Bits 0/1 always describe the fixed legacy region and contribute no extended bytes. -/
+def xCompactOffset (prof : Profile) (cpu : Nat) (format : BitVec 64) (i : Nat) : Nat :=
+  let align (j n : Nat) :=
+    if (prof.cpuid cpu 0xD (BitVec.ofNat 32 j)).ecx.getLsbD 1 then (n + 63) / 64 * 64 else n
+  let stop := (List.range (i - 2)).foldl (fun n k =>
+    let j := k + 2
+    if format.getLsbD j then align j n + (prof.cpuid cpu 0xD (BitVec.ofNat 32 j)).eax.toNat else n) 576
+  align i stop
 
 /-- Whether `MXCSR` value `v` sets only bits the processor supports (`MXCSR_MASK`, or `FFBFH` when
 the processor stores 0 there: SDM Vol. 1, 11.6.6). -/
@@ -137,9 +152,13 @@ legacy region has the format of `FXSAVE` without `REX.W` (SDM Vol. 2, "FXSAVE", 
 `FDP` as their low 32 bits, at 8 and 16, each followed by a selector (`FCS`, `FDS`) and two reserved
 bytes, which take their values from `rsv`; the selectors are 0 on a processor that deprecates them
 (`Profile.zeroesSelectors`), else they take their values from `rsv` too (`x87EnvImage` says why the
-selectors are not known). -/
+selectors are not known). `offset` supplies extended-component positions, defaulting
+to the standard CPU 0 layout. Compacted instruction saves pass compacted offsets
+and omit both legacy MXCSR runs when SSE is not saved. AMD standard partial
+requests without SSE involving x87 or AVX are rejected by the instruction wrapper;
+the Linux signal-frame caller includes SSE. -/
 def xsaveRuns (prof : Profile) (x : X87) (v : VecRegs) (pkru : BitVec 32) (rfbm : BitVec 64) {w : Nat}
-    (rsv : BitVec w) (w64 : Bool) : List (Nat × List Byte) :=
+    (rsv : BitVec w) (w64 : Bool) (offset : Nat → Nat := fun i => prof.xOffset i) : List (Nat × List Byte) :=
   let has (i : Nat) := rfbm.getLsbD i
   let r (o n : Nat) : Nat × List Byte := (o, (List.range n).map fun k => byteOf rsv (o + k))
   let ptrs := prof.vendor = .intel || x.fsw.getLsbD 7 || prof.amdErrPtrs
@@ -160,13 +179,13 @@ def xsaveRuns (prof : Profile) (x : X87) (v : VecRegs) (pkru : BitVec 32) (rfbm 
   (if has 1 || has 2 then [(24, toBytesLE v.mxcsr 4), (28, toBytesLE prof.mxcsrMask 4)] else []) ++
   (if has 1 then (List.range 16).map fun i => (160 + 16 * i, toBytesLE (zmm i) 16) else []) ++
   (if has 2 then (List.range 16).map fun i =>
-      (prof.xOffset 2 + 16 * i, toBytesLE ((zmm i).extractLsb' 128 128) 16) else []) ++
+      (offset 2 + 16 * i, toBytesLE ((zmm i).extractLsb' 128 128) 16) else []) ++
   (if has 5 then (List.range 8).map fun i =>
-      (prof.xOffset 5 + 8 * i, toBytesLE (v.k (Fin.ofNat 8 i)) 8) else []) ++
+      (offset 5 + 8 * i, toBytesLE (v.k (Fin.ofNat 8 i)) 8) else []) ++
   (if has 6 then (List.range 16).map fun i =>
-      (prof.xOffset 6 + 32 * i, toBytesLE ((zmm i).extractLsb' 256 256) 32) else []) ++
-  (if has 7 then (List.range 16).map fun i => (prof.xOffset 7 + 64 * i, toBytesLE (zmm (16 + i)) 64) else []) ++
-  (if has 9 then [(prof.xOffset 9, toBytesLE pkru 4), r (prof.xOffset 9 + 4) 4] else [])
+      (offset 6 + 32 * i, toBytesLE ((zmm i).extractLsb' 256 256) 32) else []) ++
+  (if has 7 then (List.range 16).map fun i => (offset 7 + 64 * i, toBytesLE (zmm (16 + i)) 64) else []) ++
+  (if has 9 then [(offset 9, toBytesLE pkru 4), r (offset 9 + 4) 4] else [])
 
 /-- The bits of `XSTATE_BV` `XSAVE` sets for the components in `rfbm` (SDM Vol. 1, 13.7): 1 for a
 component the conservative `Cpu.xInit` check excludes from initial state; otherwise 0 or 1
@@ -263,25 +282,24 @@ def x87Load (prof : Profile) (old : X87) (rd : Nat → Byte) (w64 : Bool) : X87 
     fip := if ptrs then (if w64 then w 8 8 64 else w 8 4 64) else old.fip,
     fdp := if ptrs then (if w64 then w 16 8 64 else w 16 4 64) else old.fdp }
 
-/-- `XRSTOR` (with `REX.W`) of the area `rd` (offset to byte, 64-byte aligned) for the components in
-`rfbm`, on processor state `c` (SDM Vol. 1, 13.8.1, the standard form): `#GP` if `XSTATE_BV` sets a
-bit not in `XCR0`, if bytes 8–23 of the header are not zero, or if `MXCSR` would be loaded with a bit
-the processor does not support; a compacted area (`XCOMP_BV` bit 63, on a processor with the
-compaction extensions, `CPUID.(EAX=0DH,ECX=1):EAX[1]`) is not modelled, nor on an Intel processor a
-loaded `FSW` whose `ES`/`B` disagree with its exceptions (`x87SummaryKnown`). Each component in `rfbm`
-is loaded if its `XSTATE_BV` bit is set and put in its initial configuration otherwise; `MXCSR` is
-loaded whenever `rfbm` has SSE or AVX. `rfbm` holds only components the model holds. -/
-def xrstor (prof : Profile) (c : Cpu) (rd : Nat → Byte) (rfbm : BitVec 64) : XLoad Cpu :=
+/-- Restore the held components selected by `rfbm` from a validated standard or compacted
+area (`compact`), at extended offsets `offset` (SDM Vol. 1 §13.8, APM Vol. 4 XRSTOR).
+The legacy x87 pointer format is selected by `w64`. The compacted form associates MXCSR
+only with SSE; its Intel init case resets MXCSR. AMD's requested SSE-init case
+is NM: SDM §13.8.2 specifies init, APM Vol. 4 XRSTOR associates compact MXCSR
+with SSE, Vol. 2 §11.5.9 says it has no initial state, and Zen 4 preserves it.
+The standard form instead has an unconditional
+MXCSR load when SSE or AVX is selected. Intel's unresolved FCW/FSW cases remain NM. -/
+def xLoadComponents (prof : Profile) (c : Cpu) (rd : Nat → Byte) (rfbm bv : BitVec 64)
+    (offset : Nat → Nat) (w64 compact : Bool) : XLoad Cpu :=
   let w (o n : Nat) (m : Nat) : BitVec m := ofBytesLE m ((List.range n).map fun k => rd (o + k))
-  let bv : BitVec 64 := w 512 8 64
-  let xcomp : BitVec 64 := w 520 8 64
   let mxcsr : BitVec 32 := w 24 4 32
   let has (i : Nat) := rfbm.getLsbD i
   let loads (i : Nat) := has i && bv.getLsbD i
-  if xcomp.getLsbD 63 && (prof.cpuid 0 0xD 1).eax.getLsbD 1 then .notModelled "compacted XSAVE area"
-  else if xcomp ≠ 0 ∨ (w 528 8 64 : BitVec 64) ≠ 0 then .gp
-  else if bv &&& ~~~(prof.xcr0.getD 0) ≠ 0 then .gp
-  else if (has 1 || has 2) && !prof.mxcsrOk mxcsr then .gp
+  let loadMx := if compact then loads 1 else has 1 || has 2
+  if compact && prof.vendor = .amd && has 1 && !bv.getLsbD 1 then
+    .notModelled "XRSTOR: compacted SSE-init MXCSR on AMD"
+  else if loadMx && !prof.mxcsrOk mxcsr then .gp
   else if loads 0 && !x87SummaryKnown prof rd then .notModelled "XRSTOR: FSW.ES/B on Intel"
   else if loads 0 && !x87FcwKnown prof (w 0 2 16) then .notModelled "XRSTOR: reserved FCW bits on Intel"
   else
@@ -292,15 +310,55 @@ def xrstor (prof : Profile) (c : Cpu) (rd : Nat → Byte) (rfbm : BitVec 64) : X
     let zmm' : Fin 32 → BitVec 512 := fun j =>
       let v := c₀.vec.zmm j
       let v := if loads 1 && j.val < 16 then part 0 128 (160 + 16 * j.val) v else v
-      let v := if loads 2 && j.val < 16 then part 128 128 (prof.xOffset 2 + 16 * j.val) v else v
-      let v := if loads 6 && j.val < 16 then part 256 256 (prof.xOffset 6 + 32 * j.val) v else v
-      if loads 7 && 16 ≤ j.val then w (prof.xOffset 7 + 64 * (j.val - 16)) 64 512 else v
+      let v := if loads 2 && j.val < 16 then part 128 128 (offset 2 + 16 * j.val) v else v
+      let v := if loads 6 && j.val < 16 then part 256 256 (offset 6 + 32 * j.val) v else v
+      if loads 7 && 16 ≤ j.val then w (offset 7 + 64 * (j.val - 16)) 64 512 else v
     .ok { c₀ with
-      x87 := if loads 0 then x87Load prof c.x87 rd true else c₀.x87
+      x87 := if loads 0 then x87Load prof c.x87 rd w64 else c₀.x87
       vec := { zmm := zmm'
-               k := fun j => if loads 5 then w (prof.xOffset 5 + 8 * j.val) 8 64 else c₀.vec.k j
-               mxcsr := if has 1 || has 2 then mxcsr else c₀.vec.mxcsr }
-      pkru := if loads 9 then w (prof.xOffset 9) 4 32 else c₀.pkru }
+               k := fun j => if loads 5 then w (offset 5 + 8 * j.val) 8 64 else c₀.vec.k j
+               mxcsr := if loadMx then mxcsr else if compact && has 1 then 0x1f80 else c₀.vec.mxcsr }
+      pkru := if loads 9 then w (offset 9) 4 32 else c₀.pkru }
+
+/-- Standard-format XRSTOR restoration, also used by Linux signal-frame restoration.
+Checks XSTATE_BV against XCR0 and header bytes 8–23 for zero, then restores components.
+On AMD, nonzero reserved header bytes 24–63 are NM: APM Vol. 4 XRSTOR's exception table
+lists them as GP, while Zen 4 accepts them in standard format; Intel's §13.8.1 does not
+require a GP there. No measurement overrides the vendor manual.
+A compacted signal area remains explicitly NM on a processor with compaction support;
+its kernel memory-footprint handling is separate from instruction execution.
+`w64` selects the x87 pointer format; extended offsets default to CPU 0's standard
+layout for the kernel (SDM Vol. 1 §13.8.1; APM Vol. 4 XRSTOR). -/
+def xrstor (prof : Profile) (c : Cpu) (rd : Nat → Byte) (rfbm : BitVec 64)
+    (w64 : Bool := true) (offset : Nat → Nat := fun i => prof.xOffset i) : XLoad Cpu :=
+  let w (o n : Nat) (m : Nat) : BitVec m := ofBytesLE m ((List.range n).map fun k => rd (o + k))
+  let bv : BitVec 64 := w 512 8 64
+  let xcomp : BitVec 64 := w 520 8 64
+  if xcomp.getLsbD 63 && prof.feat.xsavec then .notModelled "compacted XSAVE area"
+  else if xcomp ≠ 0 ∨ (w 528 8 64 : BitVec 64) ≠ 0 then .gp
+  else if bv &&& ~~~(prof.xcr0.getD 0) ≠ 0 then .gp
+  else if prof.vendor = .amd && (List.range 40).any (fun j => rd (536+j) != 0) then
+    .notModelled "XRSTOR: standard reserved header bytes 24-63 on AMD"
+  else xLoadComponents prof c rd rfbm bv offset w64 false
+
+/-- XRSTOR's standard or compacted instruction area on logical CPU `cpu` (SDM Vol. 1
+§13.8.1–13.8.2; APM Vol. 4 XRSTOR). Compaction requires the actual XSAVEC capability;
+low XCOMP_BV bits must be enabled in XCR0, XSTATE_BV must be a subset of XCOMP_BV,
+and reserved header bytes 16–63 must be zero. A set XSTATE_BV[63] remains NM: the SDM
+compact-format subset checks alone allow it with XCOMP_BV[63], §13.1 assigns it no
+component, and Zen 4 faults. The caller establishes the full possible
+memory footprint, including init-optimized components, before applying this transform. -/
+def xrstorArea (prof : Profile) (cpu : Nat) (c : Cpu) (rd : Nat → Byte)
+    (rfbm : BitVec 64) (w64 : Bool) : XLoad Cpu :=
+  let w (o n : Nat) (m : Nat) : BitVec m := ofBytesLE m ((List.range n).map fun k => rd (o + k))
+  let bv : BitVec 64 := w 512 8 64
+  let xcomp : BitVec 64 := w 520 8 64
+  if !xcomp.getLsbD 63 then
+    xrstor prof c rd rfbm w64 (fun i => (prof.cpuid cpu 0xD (BitVec.ofNat 32 i)).ebx.toNat)
+  else if !prof.feat.xsavec || (xcomp &&& ~~~((1 : BitVec 64) <<< 63)) &&& ~~~(prof.xcr0.getD 0) != 0 ||
+      bv &&& ~~~xcomp != 0 || (List.range 48).any (fun j => rd (528+j) != 0) then .gp
+  else if bv.getLsbD 63 then .notModelled "XRSTOR: compacted reserved XSTATE_BV bit63"
+  else xLoadComponents prof c rd rfbm bv (xCompactOffset prof cpu xcomp) w64 true
 
 /-- The x87 and vector state `FXRSTOR` (`w64`: with `REX.W`) loads from the 512-byte area `rd` on x87
 state `x` and vector state `v` (SDM Vol. 2, "FXRSTOR"): the x87 state (`x87Load`), `MXCSR`, and

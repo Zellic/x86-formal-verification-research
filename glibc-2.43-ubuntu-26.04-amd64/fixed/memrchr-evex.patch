@@ -1,0 +1,13 @@
+--- a/sysdeps/x86_64/multiarch/memrchr-evex.S
++++ b/sysdeps/x86_64/multiarch/memrchr-evex.S
+@@ -438,7 +438,9 @@ L(page_cross_check):
+ 	jz	L(page_cross_continue)
+ 
+ 	lzcnt	%VRSI, %VRSI
+-	subl	%esi, %edx
++	/* rdx may exceed 32 bits here, so the subtraction must be
++	   64-bit.  */
++	subq	%rsi, %rdx
+ L(page_cross_ret):
+ 	leaq	-1(%rdi, %rdx), %rax
+ 	ret

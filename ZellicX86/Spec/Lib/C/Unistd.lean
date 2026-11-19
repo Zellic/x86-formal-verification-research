@@ -78,7 +78,7 @@ def ioBuf (s : State) : Rgn := ⟨s.cpu.gpr.rsi, s.cpu.gpr.rdx.toNat⟩
 
 /-- The C library `L`'s `read(fd, buf, n)` (`fd` in `edi`, `buf` in `rsi`, `n` in `rdx`; POSIX.1-2024 `read`) at the
 ghost `g`, on a processor with features `feat`, as a contract over the runtime (`Runtime.call`): with its stack
-(`Runtime.readStack` bytes below `rsp`) apart from the buffer, the buffer apart from `errno` and from what the library
+(`Runtime.readStack` bytes below `rsp`) apart from the buffer (as at every call, `CallOf`), the buffer apart from `errno` and from what the library
 reads without owning it, and holding none of the library's own data outside the program's blocks (`InLive`), it writes at most its stack, `errno` and the buffer (and the
 library's memory), moves at most the position on `fd` (the descriptor as the kernel reads it, `arg32`), writes to no
 file, and returns with the library's invariant, the program's blocks outside the buffer and their pages kept
@@ -87,9 +87,9 @@ exactly one system call `ev`, a `read` of `n` bytes from `fd` into `buf` (`Event
 (`SysResult`) and whose bytes are at `buf` at the return. -/
 def read (L : Runtime) (feat : Features) (g : Ghost) : Contract :=
   L.call feat g
-    { stack := L.readStack
+    { stack := fun _ => L.readStack
       writes := fun s => [ioBuf s]
-      pre := fun s => Apart [frame s L.readStack] [ioBuf s] ∧ Apart [ioBuf s] [L.errnoLoc s] ∧ InLive g (ioBuf s) ∧
+      pre := fun s => Apart [ioBuf s] [L.errnoLoc s] ∧ InLive g (ioBuf s) ∧
         Apart [ioBuf s] (L.reads s.cpu.seg.fsBase)
       post := fun s X => KeepsLive g.live [ioBuf s] s X ∧
         (X.cpu.gpr.rax = -1 ∨ X.cpu.gpr.rax.toNat ≤ s.cpu.gpr.rdx.toNat) ∧
@@ -100,7 +100,7 @@ def read (L : Runtime) (feat : Features) (g : Ghost) : Contract :=
 
 /-- The C library `L`'s `write(fd, buf, n)` (`fd` in `edi`, `buf` in `rsi`, `n` in `rdx`; POSIX.1-2024 `write`) at the
 ghost `g`, on a processor with features `feat`, as a contract over the runtime (`Runtime.call`): with its stack
-(`Runtime.writeStack`) apart from the buffer, the buffer apart from `errno` (which the call writes; the buffer may lie
+(`Runtime.writeStack`) apart from the buffer (as at every call, `CallOf`), the buffer apart from `errno` (which the call writes; the buffer may lie
 over what the library reads, as two things read), a descriptor whose `write` puts its bytes
 into no memory the process maps (`WriteUnmapped`), and the signals the kernel sends in a `write` it does not complete
 (`SIGPIPE`, `SIGXFSZ`) not handled (ignored or by default; blocked or not), it reads the buffer, writes at most its stack
@@ -112,9 +112,9 @@ the buffer holds at the call (`Event.IsWriteFault`), whose result it returns (`S
 that `write` (`Outcome.KilledInWrite`), with no event. -/
 def write (L : Runtime) (feat : Features) (g : Ghost) : Contract :=
   L.call feat g
-    { stack := L.writeStack
+    { stack := fun _ => L.writeStack
       reads := fun s => [ioBuf s]
-      pre := fun s => Apart [frame s L.writeStack] [ioBuf s] ∧ Apart [ioBuf s] [L.errnoLoc s] ∧
+      pre := fun s => Apart [ioBuf s] [L.errnoLoc s] ∧
         WriteUnmapped s (arg32 s.cpu.gpr.rdi) ∧
         ((s.proc.sighand Signal.SIGPIPE).disp = .ignore ∨ (s.proc.sighand Signal.SIGPIPE).disp = .default) ∧
         ((s.proc.sighand Signal.SIGXFSZ).disp = .ignore ∨ (s.proc.sighand Signal.SIGXFSZ).disp = .default)
@@ -133,8 +133,9 @@ called under `sysv`, it never returns, writes nothing but its return address's s
 making no system call before. -/
 def _exit : Contract where
   conv := sysv
+  stack := fun _ => 0
   reads _ := []
-  writes s := [frame s 0]
+  writes _ := []
   pre _ := True
   post _ _ := False
   events _ _ evs := evs = []

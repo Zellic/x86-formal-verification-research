@@ -201,7 +201,11 @@ def RoundsThen (R : List Event → Prop) (evs last : List Event) : Prop :=
 /-! ## Contracts -/
 
 /-- The `k` bytes of stack below `rsp` in `s` and the 8 bytes at `rsp` (at a function's entry,
-the return address): the region a function with a frame of at most `k` bytes uses. -/
+the return address): the region a function with a frame of at most `k` bytes uses, its stack frame. At a call
+(`CallOf`) no object of the caller lies there: the call itself wrote the return address into the 8 bytes at `rsp`,
+and the bytes below `rsp` are dead to the caller (its red zone, the 128 bytes below `rsp`, holds only "temporary data
+that is not needed across function calls": psABI §3.2.2, "The Stack Frame"), so a pointer the caller passes into them
+would be a dangling one. -/
 def frame (s : State) (k : Nat) : Rgn := ⟨s.cpu.gpr.rsp - BitVec.ofNat 64 k, k + 8⟩
 
 /-- The regions a call uses, by what it does with them: the data it `writes`, the memory it `own`s
@@ -223,8 +227,8 @@ def Footprint.data (fp : Footprint) : List Rgn := fp.writes ++ fp.own ++ fp.read
 use. `own` is held to everything `writes` is except accessibility, and must also be memory the function
 may unmap (`NotFixed`): a function may have made what it owns inaccessible itself (a guard page, pages
 it unmapped), and what it may do there is its contract's business (an allocator's invariant over the
-accesses it may make, `Heap.access`). How the data regions lie relative to each other (a stack frame
-apart from the buffers, an output apart from an input) is not said here: it is part of a contract's
+accesses it may make, `Heap.access`). How the data regions lie relative to each other is not said here:
+a call's stack frame apart from its data is `CallOf.frameApart`'s, an output apart from an input a contract's
 precondition. -/
 structure Footprint.Ok (feat : Features) (s : State) (fp : Footprint) : Prop where
   /-- No region and no segment reaches past `2 ^ 64`. -/
@@ -268,28 +272,38 @@ structure Ready (feat : Features) (s : State) : Prop where
   bytes; the rest of the layout it keeps (`KeepsEnvProt`): a C library's startup, which may change the library's own
   memory (`CStart.statics`) as each of its later calls may, and re-protects its RELRO segment (`CStart.protects`). It
   neither unmaps nor remaps the pages of `prot`, so its callers keep knowing where they are. The program break as for
-  `owns`. -/
+  `owns`.
+
+`owns` and `protects` take a bound `uses` (Malte, 2026-11-06; notebook note 380 §16.3): with `some u` the function grows
+what the address-space and data limits count by at most `u` bytes (`UsesAtMost`); with `none` (the default) it declares no
+bound. `u` is a term over the call's entry state (`Contract.layout` is a function of it), not a constant: a recursive
+function's bound may depend on its argument. `keeps` grows nothing. -/
 inductive Layout where
   | keeps
-  | owns (own : List Rgn) (movesBrk : Bool)
-  | protects (own prot : List Rgn) (movesBrk : Bool)
+  | owns (own : List Rgn) (movesBrk : Bool) (uses : Option Nat := none)
+  | protects (own prot : List Rgn) (movesBrk : Bool) (uses : Option Nat := none)
 
 /-- The regions a function with the layout rule `l` owns, whose bytes it may change besides those it writes: `own` for
 `owns own _`, `own` and `prot` for `protects own prot _`, none for `keeps`. -/
 def Layout.owned : Layout → List Rgn
   | .keeps => []
-  | .owns own _ => own
-  | .protects own prot _ => own ++ prot
+  | .owns own _ _ => own
+  | .protects own prot _ _ => own ++ prot
 
 /-- From the call `s₀` to `X`, on a processor with features `feat`, the layout changed only as the rule `l` allows:
 `KeepsEnv` for `keeps`; `KeepsEnvOut feat own` for `owns own movesBrk` and `KeepsEnvProt feat own prot` for
 `protects own prot movesBrk` (a layout such a processor's process can have stays one, `LayoutOk feat`), and the program
-break as at the call unless `movesBrk`. -/
+break as at the call unless `movesBrk`; with a bound `some u`, what the limits count grew by at most `u` bytes
+(`UsesAtMost s₀ X u`). -/
 def KeepsLayout (feat : Features) : Layout → State → State → Prop
   | .keeps, s₀, X => KeepsEnv s₀ X
-  | .owns own movesBrk, s₀, X => KeepsEnvOut feat own s₀ X ∧ (movesBrk = false → X.proc.mm.brk = s₀.proc.mm.brk)
-  | .protects own prot movesBrk, s₀, X =>
+  | .owns own movesBrk none, s₀, X => KeepsEnvOut feat own s₀ X ∧ (movesBrk = false → X.proc.mm.brk = s₀.proc.mm.brk)
+  | .owns own movesBrk (some u), s₀, X =>
+    (KeepsEnvOut feat own s₀ X ∧ (movesBrk = false → X.proc.mm.brk = s₀.proc.mm.brk)) ∧ UsesAtMost s₀ X u
+  | .protects own prot movesBrk none, s₀, X =>
     KeepsEnvProt feat own prot s₀ X ∧ (movesBrk = false → X.proc.mm.brk = s₀.proc.mm.brk)
+  | .protects own prot movesBrk (some u), s₀, X =>
+    (KeepsEnvProt feat own prot s₀ X ∧ (movesBrk = false → X.proc.mm.brk = s₀.proc.mm.brk)) ∧ UsesAtMost s₀ X u
 
 /-- What a function promises its callers, independently of its code. Called under convention `conv` from a state
 satisfying `pre`, in which the regions `reads` are readable and `writes` writable, it either returns or ends the
@@ -299,9 +313,16 @@ events satisfy `events` (for a function without system calls, `fun _ _ evs => ev
 the state after the piece of code the contract is about: a function's return (`ImplementsCall`) or, for code whose part
 ends elsewhere (`ImplementsCallUpto`, `ImplementsAtUpto`), the state that part reaches. If it ends the process, the
 outcome and the events satisfy `ends` of the entry state. The regions are functions of the entry state (they depend on
-arguments); `writes` includes the function's stack frame (`frame`). `reads` is what the function needs
-readable; nothing bounds which bytes the code reads (a vector load may read past an object on the
-object's pages, which cannot fault where the object's bytes do not).
+arguments). `stack s` is the most bytes the function's code uses below its entry `rsp` when called from `s`, the return
+addresses of its own `call`s and its callees' frames included (`fun _ => k` for a function whose frames have fixed sizes;
+a function of the arguments, or of what they point to, for a recursion's depth or a variable-length array's or an
+`alloca`'s size): it writes its stack frame `frame s (stack s)` (the return address's 8 bytes and those `stack s` bytes
+below them) besides the regions `writes` (`Contract.writesWithFrame`), and a call has every other region
+of the contract apart from that frame (`CallOf`). `reads` is what the function needs readable; nothing bounds which
+bytes the code reads (a vector load may read past an object on the object's pages, which cannot fault where the
+object's bytes do not). `probes` (none unless given) are regions the function needs readable too but whose bytes its
+promises do not depend on (a vector load before an object of no bytes, whose result the code ignores): a call needs
+them readable and unaliased as `reads`, but not apart from the function's frame (`CallOf`).
 
 `ends` is `False` unless given: such a function never ends the process. A function with run-time
 checks that end the process when they fail (`assert`, a Rust panic under `panic = abort`,
@@ -334,8 +355,10 @@ write a file or change its size (`EnvEvent.fileWrite`, `EnvEvent.fileSize`) leav
 never return, or whose precondition is false, never needs its frame). `Undisturbed` excludes all of these. -/
 structure Contract where
   conv : Conv
+  stack : State → Nat
   reads : State → List Rgn
   writes : State → List Rgn
+  probes : State → List Rgn := fun _ => []
   pre : State → Prop
   post : State → State → Prop
   events : State → State → List Event → Prop
@@ -347,35 +370,44 @@ structure Contract where
   writesTo : State → List Nat := fun _ => []
   env : State → Oracle → Prop := fun _ => Undisturbed
 
+/-- The regions a function with contract `C` writes from `s`: its stack frame of `C.stack s` bytes (`frame`) and
+`C.writes`. -/
+abbrev Contract.writesWithFrame (C : Contract) (s : State) : List Rgn := frame s (C.stack s) :: C.writes s
+
 /-- The footprint of a call of a function with contract `C` and code segments `code` from `s`: the
-contract's regions at `s` and what the function owns there by its layout rule. -/
+contract's regions at `s` (those it writes, its frame among them: `Contract.writesWithFrame`; those it probes and those
+it reads) and what the function owns there by its layout rule. -/
 def Contract.footprint (C : Contract) (code : List (Addr × List Byte)) (s : State) : Footprint where
-  writes := C.writes s
+  writes := C.writesWithFrame s
   own := (C.layout s).owned
-  reads := C.reads s
+  reads := C.probes s ++ C.reads s
   code := code
 
 /-- `s₀` is a call, on processor `prof`, of the function at `entry` with code segments `code` and
 contract `C`, returning to `ra`: the state is at `entry` (`CallShape`, under `C.conv`), the thread may
-start a call (`Ready`), the call's footprint is ordinary memory it can use (`Footprint.Ok`), and the
-contract's precondition holds. -/
+start a call (`Ready`), the call's footprint is ordinary memory it can use (`Footprint.Ok`), the function's stack
+frame (`frame s₀ (C.stack s₀)`) lies apart from the other regions it writes, those it owns and those it reads (not from
+those it only probes, `Contract.probes`), and the contract's precondition holds. The frame's part excludes no call a
+caller can make with valid pointers: the return address's 8 bytes were just written by the call, and the bytes below
+`rsp` hold nothing of the caller's (`frame`). -/
 structure CallOf (prof : Profile) (entry : Addr) (code : List (Addr × List Byte)) (C : Contract)
     (s₀ : State) (ra : Addr) : Prop where
   shape : CallShape prof.feat C.conv s₀ entry ra
   ready : Ready prof.feat s₀
   foot : (C.footprint code s₀).Ok prof.feat s₀
+  frameApart : Apart [frame s₀ (C.stack s₀)] (C.writes s₀ ++ (C.layout s₀).owned ++ C.reads s₀)
   pre : C.pre s₀
 
 /-- The frame condition of contract `C`: what a call of the function from `s₀` left alone at `X`: the
 layout as its layout rule allows (`KeepsLayout`), the thread's settings but those it sets and its pending signals but
 those it may leave pending (`KeepsSettingsBut`), the process's state outside memory but the positions it moves (`KeepsProc`),
 every file but those of the descriptors it writes to (`KeepsFilesBut`), and
-every byte but those of the regions it writes, of what it owns, and of the ids the kernel writes into the
+every byte but those of the regions it writes (its stack frame among them, `Contract.writesWithFrame`), of what it owns, and of the ids the kernel writes into the
 `rseq` area (`rseqIds`). On a processor with features `feat`: the layout kept is one such a processor's process can
 have (`LayoutOk feat`). (Not to be confused with a page's bytes, `Frame`, or a function's stack frame, `frame`.) -/
 def Contract.Frame (C : Contract) (feat : Features) (s₀ X : State) : Prop :=
   KeepsLayout feat (C.layout s₀) s₀ X ∧ KeepsSettingsBut (C.sets s₀) (C.pends s₀) s₀ X ∧ KeepsProc (C.moves s₀) s₀ X ∧
-    KeepsFilesBut (C.writesTo s₀) s₀ X ∧ ChangesOnly s₀ X (C.writes s₀ ++ (C.layout s₀).owned ++ rseqIds s₀)
+    KeepsFilesBut (C.writesTo s₀) s₀ X ∧ ChangesOnly s₀ X (C.writesWithFrame s₀ ++ (C.layout s₀).owned ++ rseqIds s₀)
 
 /-- `X` is a state reached, with the system-call events `evs` on the way, by a run of code with contract `C` that
 started in `s₀`, as `C` says of such a state: the frame of `C` kept up to there (`Contract.Frame`), `C.post s₀ X`
@@ -437,6 +469,75 @@ def ImplementsCall (prof : Profile) (entry : Addr) (code : List (Addr × List By
   ∀ s₀ ra, CallOf prof entry code C s₀ ra →
     ReachOrEndsIn prof (C.env s₀) s₀ (InCode code) (Returned prof.feat C s₀ ra) (C.ends s₀)
 
+/-! ## Calls whose stack frame may grow
+
+A call need not find its whole stack frame mapped: where the stack grows down (the main thread's), the kernel maps its
+pages when the code first touches them. The vocabulary for such calls, beside `ImplementsCall`'s: the frame's lowest
+bytes may lie where the stack can grow (`FrameRoom`), the call's run may grow it there (`KeepsLayoutG`), and the
+system refuses no growth within the frame (`StackGrowsTo`). Decided (Malte, 2026-11-06; notebook note 382 §6):
+`ImplementsCallG` becomes `ImplementsCall`, today's `ImplementsCall` over a mapped frame the internal form proofs
+establish; the rename is open item 44's next step. -/
+
+/-- The footprint of a call of `C` from `s` whose stack frame's first `n` bytes are not yet mapped: `Contract.footprint`
+with only the rest of the frame, from its `n`-th byte, among the regions written. -/
+def Contract.footprintG (C : Contract) (code : List (Addr × List Byte)) (s : State) (n : Nat) : Footprint :=
+  { C.footprint code s with
+    writes := ⟨(frame s (C.stack s)).base.add n, (frame s (C.stack s)).len - n⟩ :: C.writes s }
+
+/-- `CallOf` but for the stack frame's first `n` bytes, which the kernel can map by growing the stack (`FrameRoom`): the
+call's footprint, with only the rest of the frame (`Contract.footprintG`), is ordinary memory it can use, and the whole
+frame lies apart from the other regions. With `n = 0` it is `CallOf`. -/
+structure CallOfGAt (prof : Profile) (entry : Addr) (code : List (Addr × List Byte)) (C : Contract)
+    (s₀ : State) (ra : Addr) (n : Nat) : Prop where
+  shape : CallShape prof.feat C.conv s₀ entry ra
+  ready : Ready prof.feat s₀
+  foot : (C.footprintG code s₀ n).Ok prof.feat s₀
+  room : FrameRoom prof s₀ (frame s₀ (C.stack s₀)) n
+  frameApart : Apart [frame s₀ (C.stack s₀)] (C.writes s₀ ++ (C.layout s₀).owned ++ C.reads s₀)
+  pre : C.pre s₀
+
+/-- `s₀` is a call of the function at `entry` with contract `C` whose stack frame the stack can grow into
+(`CallOfGAt`, for some number of its first bytes not yet mapped). -/
+def CallOfG (prof : Profile) (entry : Addr) (code : List (Addr × List Byte)) (C : Contract) (s₀ : State)
+    (ra : Addr) : Prop :=
+  ∃ n, CallOfGAt prof entry code C s₀ ra n
+
+/-- `KeepsLayout` for a call whose run may grow the stack into its frame `r`: a function that keeps the layout
+(`Layout.keeps`) keeps it but for pages no mapping held at the call, which it may have mapped (`KeepsEnvOut` with nothing
+owned: anonymous memory aliasing none of the rest), all of them pages of `r`, and keeps the program break as it was;
+the other layout rules allow new mappings already, and a bound `some u` on what the limits count grows by the bytes of
+`r`'s pages (`Rgn.endPage`), which the kernel counts once it grew the stack into them (`total_vm`). -/
+def KeepsLayoutG (feat : Features) (l : Layout) (r : Rgn) (s₀ X : State) : Prop :=
+  match l with
+  | .keeps => KeepsLayout feat (.owns [] false) s₀ X ∧
+      ∀ p, s₀.proc.mm.mem.map p = none → (X.proc.mm.mem.map p).isSome = true → ∃ a, r.Mem a ∧ pageOf a = p
+  | .owns own mb u => KeepsLayout feat (.owns own mb (u.map (· + 4096 * (r.endPage - (pageOf r.base).toNat)))) s₀ X
+  | .protects own prot mb u =>
+    KeepsLayout feat (.protects own prot mb (u.map (· + 4096 * (r.endPage - (pageOf r.base).toNat)))) s₀ X
+
+/-- `Returned` for a call whose run may grow the stack into its frame: the layout as `KeepsLayoutG` allows, the rest of
+the frame condition (`Contract.Frame`), `post` and `events` as `Returned` asks. -/
+def ReturnedG (feat : Features) (C : Contract) (s₀ : State) (ra : Addr) (X : State) (evs : List Event) : Prop :=
+  Returns C.conv s₀ ra X ∧
+    KeepsLayoutG feat (C.layout s₀) (frame s₀ (C.stack s₀)) s₀ X ∧
+    KeepsSettingsBut (C.sets s₀) (C.pends s₀) s₀ X ∧ KeepsProc (C.moves s₀) s₀ X ∧
+    KeepsFilesBut (C.writesTo s₀) s₀ X ∧ ChangesOnly s₀ X (C.writesWithFrame s₀ ++ (C.layout s₀).owned ++ rseqIds s₀) ∧
+    C.post s₀ X ∧ C.events s₀ X evs
+
+/-- `ImplementsCall` for calls whose stack frame the stack can grow into (`CallOfG`), on the runs in which the system
+refuses no growth within the frame's pages (`StackGrowsTo`, from the frame's first page to the page after its last,
+`Rgn.endPage`) and places no new mapping there or within the guard gap below (`PlacesAvoid`): every such call either
+returns as `C` says, its layout kept but for the stack grown into its frame (`ReturnedG`), or ends the process as
+`C.ends` allows, executing only `code` until then. A function proved by `ImplementsCall` over a mapped frame has it
+(notebook note 382 §4). -/
+def ImplementsCallG (prof : Profile) (entry : Addr) (code : List (Addr × List Byte)) (C : Contract) : Prop :=
+  ∀ s₀ ra, CallOfG prof entry code C s₀ ra →
+    ReachOrEndsIn prof (fun o => C.env s₀ o ∧
+        StackGrowsTo (pageOf (frame s₀ (C.stack s₀)).base).toNat (frame s₀ (C.stack s₀)).endPage o ∧
+        PlacesAvoid (pageOf (frame s₀ (C.stack s₀)).base).toNat (frame s₀ (C.stack s₀)).endPage
+          prof.linux.stackGuardGap o) s₀
+      (InCode code) (ReturnedG prof.feat C s₀ ra) (C.ends s₀)
+
 /-- The code segments `code` implement contract `C` at `entry` on processor `prof` up to the state `C.post`
 describes: every call of it (`CallOf`), on every run in the environment `C` assumes, reaches a state `X` with the frame
 kept up to there, `C.post s₀ X` and the events so far satisfying `C.events` (`Contract.Reached`), or ends the process
@@ -471,7 +572,7 @@ def ImplementsCallUptoIf (prof : Profile) (entry : Addr) (code : List (Addr × L
 contract's precondition holds. `CallOf` without the call: the code is entered other than by a call, where a call it
 made returns (a C library's exit, entered where the program's `main` returns into the library), so there is no
 return address on the stack, and what holds of `rsp` and the flags (a return's `Conv.exit`) is the precondition's
-business. -/
+business, as is how the regions lie relative to the stack frame (`CallOf`'s frame part rests on the call). -/
 structure ResumeOf (prof : Profile) (entry : Addr) (code : List (Addr × List Byte)) (C : Contract) (s₀ : State) :
     Prop where
   rip : s₀.cpu.rip = entry
@@ -497,6 +598,9 @@ depend on, so that what a caller does outside it keeps the invariant.
 - `access`: the accesses the thread may make at the bytes the allocator owns, and none at any other
   address (`Heap.access`): which of its pages it may read and write, without the mappings' other
   details;
+- `allowed`: the accesses the mappings allow at the bytes the allocator owns, and none at any other address
+  (`Heap.allowed`): `access` but for pages of huge pages not yet allocated, whose first access the kernel may still
+  refuse (`Allowed`);
 - `brk`: the program break (`Mm.brk`): an allocator that grows by `brk` keeps where it thinks the break
   is (musl's `ctx.brk`), and is right only while nobody else moves it;
 - `fs`: the thread's `FS` base (`Segs.fsBase`), at which its thread-local storage lies (glibc's `tcache`
@@ -507,6 +611,7 @@ depend on, so that what a caller does outside it keeps the invariant.
 structure Heap.View where
   bytes : Addr → Byte
   access : Addr → Access → Prop
+  allowed : Addr → Access → Prop
   brk : Addr
   fs : Addr
   reads : Addr → Byte
@@ -551,17 +656,25 @@ what the allocator owns and `PKRU` keeps it. -/
 def Heap.access (feat : Features) (own : List Rgn) (s : State) (a : Addr) (acc : Access) : Prop :=
   Foot own a ∧ a.canonical feat.la57 = true ∧ s.proc.mm.mem.check feat s.cpu.pkru acc a = none
 
+/-- The accesses the mappings of `s` allow at the bytes of the regions `own`, on a processor with features `feat`
+(`Heap.View.allowed`): `acc` at `a` when `a` lies in `own`, is canonical and passes `Memory.checkRights` with the
+thread's `PKRU` (`Heap.access`, with a page of a huge page not yet allocated counted as present); none at any other
+address. -/
+def Heap.allowed (feat : Features) (own : List Rgn) (s : State) (a : Addr) (acc : Access) : Prop :=
+  Foot own a ∧ a.canonical feat.la57 = true ∧ s.proc.mm.mem.checkRights feat s.cpu.pkru acc a = none
+
 /-- The bytes of `s` in the regions `rs`, and `0` at every other address (`Heap.View.reads`). -/
 def Heap.readBytes (rs : List Rgn) (s : State) (a : Addr) : Byte :=
   if Foot rs a then s.proc.mm.mem.readByte a else 0
 
 /-- What the invariant of the allocator `H` owning the regions `own`, with the blocks `live` live, sees of
 the state `s` on a processor with features `feat`: the bytes it owns outside the live blocks, the
-accesses the thread may make at what it owns, the program break, the thread's `FS` base, and the bytes it
+accesses the thread may make and those the mappings allow at what it owns, the program break, the thread's `FS` base, and the bytes it
 reads without owning them there. -/
 def Heap.view (H : Heap) (feat : Features) (own : List Rgn) (s : State) (live : List Rgn) : Heap.View where
   bytes := Heap.bytes own s live
   access := Heap.access feat own s
+  allowed := Heap.allowed feat own s
   brk := s.proc.mm.brk
   fs := s.cpu.seg.fsBase
   reads := Heap.readBytes (H.reads s.cpu.seg.fsBase) s
@@ -618,40 +731,61 @@ promises, and a caller of the allocator at its return. -/
 def Heap.Intact (H : Heap) (feat : Features) (s X : State) (own live : List Rgn) : Prop :=
   ∃ own', Heap.Next s X live own own' ∧ H.inv own' (H.view feat own' X live) live
 
+/-- At `malloc`'s return `X`, where the allocator owns the regions `own` and the blocks `live` were live at the call,
+`b` is a new block (`Heap.malloc`'s non-null case, C17 7.22.3.4: "returns ... a pointer to the allocated space"; `b` the
+block `⟨X.cpu.gpr.rax, n⟩` of the `n` bytes asked for):
+`rax` is not null, the block fits, its address is aligned to `H.align`, it lies in what the allocator owns (so it aliases
+no other memory the allocator owns, and none of its caller's) and apart from the live blocks, it can be written, and the
+allocator's invariant holds with it live too. -/
+structure Heap.NewBlock (H : Heap) (feat : Features) (X : State) (own live : List Rgn) (b : Rgn) : Prop where
+  /-- The result is not a null pointer. -/
+  nonnull : X.cpu.gpr.rax ≠ 0
+  /-- The block fits in the address space (`Rgn.Fits`). -/
+  fits : b.Fits
+  /-- Its address is a multiple of the allocator's alignment. -/
+  aligned : X.cpu.gpr.rax.toNat % H.align = 0
+  /-- Its bytes are among those the allocator owns. -/
+  owned : ∀ a, b.Mem a → Foot own a
+  /-- It lies apart from the blocks live at the call. -/
+  apart : Apart [b] live
+  /-- The thread may write it. -/
+  writable : Accessible feat X .write b
+  /-- The allocator's invariant holds with the block live too. -/
+  inv : H.inv own (H.view feat own X (b :: live)) (b :: live)
+
 /-- `malloc(n)` of the allocator `H` owning the regions `own` while the blocks `live` are live, on a
 processor with features `feat` (C17 7.22.3.4; `n` in `rdi`, the result in `rax`), as a contract:
-called with its invariant holding, its stack frame apart from what it owns, the live blocks in what it
+called with its invariant holding (its stack frame of `H.stack` bytes apart from what it owns, as every call's is:
+`CallOf`), the live blocks in what it
 owns, `PKRU` allowing access with key 0 (the key of every new mapping), and what it reads and changes
 without owning it apart from its frame and what it owns (`Heap.Outside`), it reads `H.reads`, writes at
 most its frame, `H.writes` and `own`, may map new memory, change the layout of the pages wholly in `own`
 and move the program break (`layout`), and makes only the memory calls of an allocator
 (`Event.IsMemCall`); it leaves the bytes of the live blocks and the mappings of their pages as they are, and returns owning some regions `own'` (`Heap.Next`) and
 either a null pointer, its invariant holding for the same live blocks, or the address `p` of a new
-block `⟨p, n⟩` of `n` bytes that fits, is aligned to `H.align`, lies in `own'` (so it aliases no other
+block `⟨p, n⟩` of `n` bytes (`Heap.NewBlock`: it fits, is aligned to `H.align`, lies in `own'` (so it aliases no other
 memory it owns, and none of its caller's) and apart from the live blocks, and can be written, its
-invariant holding with that block live too. (Without the live blocks in `own`, so apart from the
+invariant holding with that block live too). (Without the live blocks in `own`, so apart from the
 frame, no code could keep this contract for every `live`: its own stack writes would change the bytes
 of a block in its frame.) -/
 def Heap.malloc (H : Heap) (feat : Features) (own live : List Rgn) : Contract where
   conv := sysv
   reads s := H.reads s.cpu.seg.fsBase
-  writes s := frame s H.stack :: H.writes s.cpu.seg.fsBase
-  pre s := H.inv own (H.view feat own s live) live ∧ Apart [frame s H.stack] own ∧
+  stack := fun _ => H.stack
+  writes s := H.writes s.cpu.seg.fsBase
+  pre s := H.inv own (H.view feat own s live) live ∧
     (∀ a, Foot live a → Foot own a) ∧ s.cpu.pkru &&& 3 = 0 ∧ H.Outside s H.stack own
   post s X := SameBytes s X live ∧ KeepsPages live s X ∧ ∃ own', Heap.Next s X live own own' ∧
     (X.cpu.gpr.rax = 0 ∧ H.inv own' (H.view feat own' X live) live ∨
-     let b : Rgn := ⟨X.cpu.gpr.rax, s.cpu.gpr.rdi.toNat⟩
-     X.cpu.gpr.rax ≠ 0 ∧ b.Fits ∧ X.cpu.gpr.rax.toNat % H.align = 0 ∧
-       (∀ a, b.Mem a → Foot own' a) ∧ Apart [b] live ∧ Accessible feat X .write b ∧
-       H.inv own' (H.view feat own' X (b :: live)) (b :: live))
+     Heap.NewBlock H feat X own' live ⟨X.cpu.gpr.rax, s.cpu.gpr.rdi.toNat⟩)
   events _ _ evs := ∀ ev ∈ evs, Event.IsMemCall ev
   layout _ := .owns own (movesBrk := true)
 
 /-- `free(p)` of the allocator `H` owning the regions `own` (C17 7.22.3.3) for the live block
 `some b`, while the blocks `front ++ b :: back` are live (`p = b.base` in `rdi`), or of a null
 pointer, `b = none` (`p = 0`, the live blocks `front ++ back`, nothing freed), on a processor with
-features `feat`, as a contract: called with its invariant holding, its stack frame apart from what it
-owns, the live blocks in what it owns, `PKRU` allowing access with key 0 (the key of every new mapping: a
+features `feat`, as a contract: called with its invariant holding (its stack frame apart from what it
+owns, as every call's is: `CallOf`), the live blocks in what it owns, `PKRU` allowing access with key 0 (the key of every new mapping: a
 `free` may map memory, glibc's where it sets up a thread's cache), and what it reads and changes without
 owning it apart from its frame and what it owns (`Heap.Outside`), it reads `H.reads`, writes at most its
 frame, `H.writes` and `own`, may change the layout
@@ -662,9 +796,10 @@ def Heap.free (H : Heap) (feat : Features) (own front : List Rgn) (b : Option Rg
     Contract where
   conv := sysv
   reads s := H.reads s.cpu.seg.fsBase
-  writes s := frame s H.stack :: H.writes s.cpu.seg.fsBase
+  stack := fun _ => H.stack
+  writes s := H.writes s.cpu.seg.fsBase
   pre s := H.inv own (H.view feat own s (front ++ (b.toList ++ back))) (front ++ (b.toList ++ back)) ∧
-    s.cpu.gpr.rdi = (b.map (·.base)).getD 0 ∧ Apart [frame s H.stack] own ∧
+    s.cpu.gpr.rdi = (b.map (·.base)).getD 0 ∧
     (∀ a, Foot (front ++ (b.toList ++ back)) a → Foot own a) ∧ s.cpu.pkru &&& 3 = 0 ∧ H.Outside s H.stack own
   post s X := SameBytes s X (front ++ back) ∧ KeepsPages (front ++ back) s X ∧
     H.Intact feat s X own (front ++ back)
@@ -690,8 +825,8 @@ def Heap.ImplementedBy (H : Heap) (prof : Profile) (code : List (Addr × List By
   H.MallocAt prof mallocE code ∧ H.FreeAt prof freeE code
 
 /-- What a function that uses an allocator says of itself besides the allocator (`Heap.client`): the
-bytes of stack its own code uses below its entry `rsp`, the return addresses its own `call`s push included
-(`stack`; the allocator's `H.stack` come below them), the
+bytes of stack its own code uses below its entry `rsp`, the return addresses its own `call`s push included, as a
+function of the entry state as a contract's (`stack`; the allocator's `H.stack` come below them), the
 regions it reads and writes besides its stack (`reads`, `writes`, functions of the entry state; none
 unless given), its precondition `pre` (`True` unless given), its postcondition `post` about the
 entry and the return state, and, as in a `Contract` (whose fields of the same names they become):
@@ -706,7 +841,7 @@ entry and the return state, and, as in a `Contract` (whose fields of the same na
 - `env`: what it assumes of the environment while it runs (`Contract.env`); `Undisturbed` unless
   given. -/
 structure Heap.Use where
-  stack : Nat
+  stack : State → Nat
   reads : State → List Rgn := fun _ => []
   writes : State → List Rgn := fun _ => []
   pre : State → Prop := fun _ => True
@@ -721,8 +856,10 @@ structure Heap.Use where
 
 /-- The contract of a function `u` that uses the allocator `H` (calls its `malloc` and `free`), owning the
 regions `own` at the call, while its caller's blocks `live` are live, on a processor with features
-`feat`: called with the allocator's invariant holding, its stack (its own `u.stack` bytes, the return
-address and the allocator's `H.stack`) apart from what the allocator owns, the live blocks in what it
+`feat`: called with the allocator's invariant holding (its stack, its own `u.stack s` bytes, the return
+address and the allocator's `H.stack`, apart from what the allocator owns and from `u.reads` and `u.writes`, as every
+call's is: `CallOf`), the live
+blocks in what it
 owns, `PKRU` allowing access with key 0 (the allocator may map memory), `u.pre`, and what the allocator
 reads and changes without owning it apart from that stack and what it owns (`Heap.Outside`), it returns
 with the allocator intact for the live blocks `u.live` gives (`Heap.Intact`; those at the call unless
@@ -735,9 +872,10 @@ and `u.post`. -/
 def Heap.client (H : Heap) (feat : Features) (own live : List Rgn) (u : Heap.Use) : Contract where
   conv := sysv
   reads s := H.reads s.cpu.seg.fsBase ++ u.reads s
-  writes s := frame s (H.stack + u.stack) :: (H.writes s.cpu.seg.fsBase ++ u.writes s)
-  pre s := H.inv own (H.view feat own s live) live ∧ Apart [frame s (H.stack + u.stack)] own ∧
-    (∀ a, Foot live a → Foot own a) ∧ s.cpu.pkru &&& 3 = 0 ∧ u.pre s ∧ H.Outside s (H.stack + u.stack) own
+  stack s := H.stack + u.stack s
+  writes s := H.writes s.cpu.seg.fsBase ++ u.writes s
+  pre s := H.inv own (H.view feat own s live) live ∧
+    (∀ a, Foot live a → Foot own a) ∧ s.cpu.pkru &&& 3 = 0 ∧ u.pre s ∧ H.Outside s (H.stack + u.stack s) own
   post s X := H.Intact feat s X own (u.live live s X) ∧ u.post s X
   events := u.events
   ends := u.ends

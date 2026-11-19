@@ -27,12 +27,15 @@ those regions; it carries them as a ghost (`Ghost`), from call to call, as an al
 - `streams`: its open streams, as the program sees them (`Spec/Lib/C/Stdio.lean`).
 
 A library instance (`Runtime`) has an abstract invariant over the ghost and what the library sees of the process
-(`Heap.View`: the bytes it owns outside the program's blocks, the accesses there, the program break, the `FS` base, the
+(`Heap.View`: the bytes it owns outside the program's blocks, the accesses there and those its mappings allow, the program break, the `FS` base, the
 bytes it reads without owning them). A statement that quantifies over the library holds for every library keeping its
 contracts, whatever it keeps and whatever its invariant says. Every function over the runtime (`Runtime.call`: the
 library's functions, and the program's functions that call them) assumes the invariant at the call and promises it at
 the return for the ghost at the return, which may own other memory (`Heap.Next`: what it owned, or memory mapped
-since); a program's code keeps it by not storing into what the library owns outside the program's blocks. The
+since); a program's code keeps it by not storing into what the library owns outside the program's blocks (where
+the library owns pages of a mapping of huge pages, also by its stores into its own blocks there, since a store into one
+allocates the whole huge page, `Backing.hugeEmpty`, which changes the accesses the library sees, `Heap.View.access`, but
+not those its mappings allow, `Heap.View.allowed`: see open item 42). The
 library's startup gives the first ghost and its exit takes the last (`Spec/Lib/C/Start.lean`).
 
 The allocator is a part of the runtime: `Runtime.heap L g` is the allocator (`Heap`) the library is at the ghost `g`,
@@ -149,8 +152,8 @@ def KeepsLive (live ws : List Rgn) (s X : State) : Prop :=
   (∀ a, Foot live a → ¬ Foot ws a → X.proc.mm.mem.readByte a = s.proc.mm.mem.readByte a) ∧ KeepsPages live s X
 
 /-- What a function over a C library's runtime says of itself besides the runtime (`Runtime.call`), as `Heap.Use` for an
-allocator's client: the bytes of stack it uses below its entry `rsp` with those of the library's functions it calls
-(`stack`), the regions it reads and writes besides its stack and `errno` (`reads`, `writes`, functions of the entry
+allocator's client: the bytes of stack it uses below its entry `rsp` with those of the library's functions it calls, as a
+function of the entry state (`stack`), the regions it reads and writes besides its stack and `errno` (`reads`, `writes`, functions of the entry
 state; none unless given), its precondition `pre` (`True` unless given), its postcondition `post` about the entry and
 the return state, and, as in a `Contract` (whose fields of the same names they become):
 - `live`: the program's blocks at the return, from those at the call and the entry and return states; the same as at the
@@ -163,7 +166,7 @@ the return state, and, as in a `Contract` (whose fields of the same names they b
   those whose files it may change; none unless given;
 - `env`: what it assumes of the environment while it runs (`Contract.env`); `Undisturbed` unless given. -/
 structure Fn where
-  stack : Nat
+  stack : State → Nat
   reads : State → List Rgn := fun _ => []
   writes : State → List Rgn := fun _ => []
   pre : State → Prop := fun _ => True
@@ -179,8 +182,9 @@ structure Fn where
 
 /-- The contract of a function `u` over the C library `L` at the ghost `g` (a function of the library's, or of the
 program's that calls them), on a processor with features `feat`: called under `sysv` ready to call into the library
-with its stack of `u.stack` bytes below `rsp` (`Runtime.Ready`: the library's invariant, the stack apart from what the
-library owns, `PKRU`, …) and with `u.pre`, it reads
+with its stack of `u.stack s` bytes below `rsp` (`Runtime.Ready`: the library's invariant, the stack apart from what the
+library owns, `PKRU`, …; the stack apart from `u.reads` and `u.writes` too, as at every call: `CallOf.frameApart`) and
+with `u.pre`, it reads
 `L.reads` and `u.reads`, writes at most its stack, `errno` and `u.writes`, may change the bytes and the layout of what
 the library owns, map new memory in pages unmapped at the call, and move the program break (`Layout.owns`, `KeepsEnvOut`:
 every other mapping stays as it was; the library's memory is the library's business), and
@@ -193,8 +197,9 @@ pages: `KeepsLive`) and how its own regions lie relative to the library's memory
 def Runtime.call (L : Runtime) (feat : Features) (g : Ghost) (u : Fn) : Contract where
   conv := sysv
   reads s := (L.heap g).reads s.cpu.seg.fsBase ++ u.reads s
-  writes s := frame s u.stack :: ((L.heap g).writes s.cpu.seg.fsBase ++ u.writes s)
-  pre s := L.Ready feat g u.stack s ∧ u.pre s
+  stack := u.stack
+  writes s := (L.heap g).writes s.cpu.seg.fsBase ++ u.writes s
+  pre s := L.Ready feat g (u.stack s) s ∧ u.pre s
   post s X := (L.heap g).Intact feat s X g.own (u.live g.live s X) ∧ u.post s X
   events := u.events
   ends := u.ends

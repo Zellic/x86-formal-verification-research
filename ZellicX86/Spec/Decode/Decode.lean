@@ -205,12 +205,17 @@ def select (feat : Features) (p : Pfx) (m : Option Nat) : Entry → Sel
 /-- Whether an operand is encoded in the ModRM byte. -/
 def OS.usesModRM : OS → Bool
   | .E _ | .G _ | .M | .ER _ _ | .V | .W _ | .U | .vecR _ | .vecM _ | .vecU _ | .kR | .kM _ | .STi
-  | .Mb _ => true
+  | .Mb _ | .vsib .. => true
   | _ => false
 
 /-- Whether an operand is the register `VEX.vvvv` names. -/
 def OS.usesVvvv : OS → Bool
   | .vecV _ | .gprV _ | .kV => true
+  | _ => false
+
+/-- Whether this operand needs vector rather than scalar SIB decoding. -/
+def OS.usesVsib : OS → Bool
+  | .vsib .. => true
   | _ => false
 
 /-- The operand size (SDM Vol. 2 2.2.1.2, Table 2-4; A.2.5 for `d64`/`f64`). The `66` that a
@@ -225,6 +230,7 @@ def Sz.bits (p : Pfx) (osz : Nat) : Sz → Nat
   | .z => if osz = 16 then 16 else 32
   | .y => if p.w then 64 else 32
   | .dq => 128
+  | .qq => 256
   | .x => p.vl
 
 /-- A general register operand; byte registers 4–7 are `AH`–`BH` without REX. -/
@@ -237,11 +243,13 @@ inductive RM
   | reg (n : Nat)
   /-- A memory operand. -/
   | mem (m : MemOp)
+  /-- VSIB base/displacement with a separate vector index, including SIB index 4. -/
+  | vsib (m : MemOp) (indexReg : Nat)
 
 /-- Read SIB and displacement for ModRM byte `m` (SDM Vol. 2 2.1.5, Tables 2-2, 2-3;
 2.2.1.6 RIP-relative addressing). An 8-bit displacement is multiplied by `n8` (1, or an EVEX
 instruction's `N`, SDM Vol. 2, 2.7.5). -/
-def decodeRM (p : Pfx) (n8 : Nat) (m : Nat) : D RM := do
+def decodeRM (p : Pfx) (n8 : Nat) (m : Nat) (vsib : Bool := false) : D RM := do
   let md := m / 64
   let rm := m % 8
   if md = 3 then pure (.reg (rm + p.b))
@@ -259,7 +267,11 @@ def decodeRM (p : Pfx) (n8 : Nat) (m : Nat) : D RM := do
       let scale := 2 ^ (sib / 64)
       let noBase := sib % 8 = 5 ∧ md = 0
       let d ← disp noBase
-      pure (mk (if noBase then none else some (sib % 8 + p.b)) index scale d false)
+      let base := if noBase then none else some (sib % 8 + p.b)
+      if vsib then
+        pure (.vsib ⟨p.seg, base, none, scale, d, false, p.asz, 0⟩
+          (idx + p.vvvv / 16 * 16))
+      else pure (mk base index scale d false)
     else if rm = 5 ∧ md = 0 then do
       let d ← readLE 4
       pure (mk none none 1 (sext 32 64 d) true)
@@ -275,7 +287,7 @@ def operand (p : Pfx) (osz opc : Nat) (m : Nat) (rm : Option RM) : OS → D (Opt
     match rm with
     | some (.reg n) => pure (some (gpr p (s.bits p osz) n))
     | some (.mem x) => pure (some (.mem { x with width := s.bits p osz }))
-    | none => pure none
+    | _ => pure none
   | .G s => pure (some (gpr p (s.bits p osz) ((m / 8) % 8 + p.r)))
   | .I s => do
     let w := s.bits p osz
@@ -295,7 +307,7 @@ def operand (p : Pfx) (osz opc : Nat) (m : Nat) (rm : Option RM) : OS → D (Opt
     match rm with
     | some (.reg n) => pure (some (gpr p (r.bits p osz) n))
     | some (.mem x) => pure (some (.mem { x with width := m.bits p osz }))
-    | none => pure none
+    | _ => pure none
   | .Z s => pure (some (gpr p (s.bits p osz) (opc % 8 + p.b)))
   | .A s => pure (some (gpr p (s.bits p osz) 0))
   | .one => pure (some (.imm 8 1))
@@ -306,7 +318,7 @@ def operand (p : Pfx) (osz opc : Nat) (m : Nat) (rm : Option RM) : OS → D (Opt
     match rm with
     | some (.reg n) => pure (some (.xmm n))
     | some (.mem x) => pure (some (.mem { x with width := s.bits p osz }))
-    | none => pure none
+    | _ => pure none
   | .U =>
     match rm with
     | some (.reg n) => pure (some (.xmm n))
@@ -319,10 +331,16 @@ def operand (p : Pfx) (osz opc : Nat) (m : Nat) (rm : Option RM) : OS → D (Opt
     match rm with
     | some (.reg n) => pure (some (.vreg (n + p.xhi) (s.bits p osz)))
     | some (.mem x) => pure (some (.mem { x with width := s.bits p osz }))
-    | none => pure none
+    | _ => pure none
   | .vecU s =>
     match rm with
     | some (.reg n) => pure (some (.vreg (n + p.xhi) (s.bits p osz)))
+    | _ => pure none
+  | .vsib ib ix data =>
+    match rm with
+    | some (.vsib m indexReg) => pure (some (.vsib
+        ⟨m.seg, m.base, m.scale, m.disp, m.addr32, indexReg,
+          ib, ix.bits p osz, data.bits p osz⟩))
     | _ => pure none
   | .vecV s => pure (some (.vreg p.vvvv (s.bits p osz)))
   -- a general register or an opmask register in `vvvv` is one of `0`–`15` or `k0`–`k7`: with
@@ -336,7 +354,7 @@ def operand (p : Pfx) (osz opc : Nat) (m : Nat) (rm : Option RM) : OS → D (Opt
     match rm with
     | some (.reg n) => pure (some (.kreg (n % 8)))
     | some (.mem x) => pure (some (.mem { x with width := s.bits p osz }))
-    | none => pure none
+    | _ => pure none
   | .ST0 => pure (some (.st 0))
   | .STi => pure (some (.st (m % 8)))
   | .Mb n =>
@@ -391,7 +409,10 @@ def finishForm (hle : Bool) (p : Pfx) (bad : Bool) (map opc : Nat) (m : Option N
   if form.isSome && a.f64 && p.osz && !p.w then stop (.nm map opc) else do
   -- `vvvv` must be 1111b (with `EVEX.V'`: the register number 0) where no operand uses it
   -- (SDM Vol. 2, 2.3.6; Table 2-41)
-  let vvvvOK := ops.any OS.usesVvvv || p.vvvv == 0
+  let vsib := ops.any OS.usesVsib
+  let evex : Bool := match p.vex with | some v => v.evex | none => false
+  -- With EVEX VSIB, V' extends the index, while the low four vvvv bits remain reserved.
+  let vvvvOK := ops.any OS.usesVvvv || (if vsib && evex then p.vvvv % 16 == 0 else p.vvvv == 0)
   -- EVEX: the opmask fields; `EVEX.b`; the displacement factor (SDM Vol. 2, 2.7.5)
   let (mask, n8, bc) ← match p.vex with
     | some v =>
@@ -410,7 +431,7 @@ def finishForm (hle : Bool) (p : Pfx) (bad : Bool) (map opc : Nat) (m : Option N
       else pure (some (none, false), 1, none)
     | none => pure (some (none, false), 1, none)
   let rm ← match m with
-    | some mb => do let r ← decodeRM p n8 mb; pure (some r)
+    | some mb => do let r ← decodeRM p n8 mb vsib; pure (some r)
     | none => pure none
   let xs ← operands p osz opc (m.getD 0) rm ops
   let len ← pos
@@ -421,9 +442,24 @@ def finishForm (hle : Bool) (p : Pfx) (bad : Bool) (map opc : Nat) (m : Option N
   let regB : Bool := match p.vex, a.bcst, m with
     | some v, some _, some mb => v.evex && v.b && mb / 64 == 3
     | _, _, _ => false
+  -- A documented broadcast disagreement retains its complete fetch footprint.
+  -- Prefix/operand validity still takes priority over the unsettled memory form.
+  let unsettled : Bool := match p.vex, m with
+    | some v, some mb => a.unsettledBcst && v.evex && v.b && mb / 64 != 3 &&
+      (maskOf v a.masking).isSome
+    | _, _ => false
+  if unsettled && form.isSome && (allValid xs).isSome then
+    if bad || !vvvvOK then stop .ud else stop (.nm map opc)
+  else do
   match form, allValid xs, mask with
   | some mn, some xs, some (mask, zero) =>
-    if bad || !vvvvOK then stop .ud else do
+    let gatherOK := if a.gather then
+      match xs with
+      | [.vreg d _, .vsib v, .vreg k _] => d != v.indexReg && k != v.indexReg && d != k
+      | [.vreg d _, .vsib v] => d != v.indexReg && mask.getD 0 != 0
+      | _ => false
+      else true
+    if bad || !vvvvOK || !gatherOK then stop .ud else do
     if regB then stop (.nm map opc) else do
     -- a broadcast source is one element of the memory operand
     let xs := match bc with

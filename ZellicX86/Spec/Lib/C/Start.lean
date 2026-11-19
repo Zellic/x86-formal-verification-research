@@ -67,11 +67,14 @@ with `strace` on a static program, the clock read from the code); and `writev` (
 setting in `GLIBC_TUNABLES` and goes on (`parse_tunable_print_error`, `elf/dl-tunables.c`, by `_dl_error_printf`).
 None writes to another descriptor (`Output fd` of such events is empty for every `fd` but 2).
 
-The class also admits `munmap` (11), which glibc 2.43's startup does not make: the startup calls `malloc` (from
-`call_init`), whose contract allows every memory call of an allocator (`Event.IsMemCall`, `munmap` among them). No event
+The class also admits `munmap` (11), `madvise` (28) and `prctl` (157; every option, for now: only the naming of memory,
+`Event.IsVmaName`, is a memory call, and the class narrows to it once glibc's startup event lists carry it, an open
+item), which glibc 2.43's startup does not make with the
+tunables it covers: the startup calls `malloc` (from `call_init`), whose contract allows every memory call of an allocator
+(`Event.IsMemCall`, `munmap`, `madvise` and the naming of memory, `prctl(PR_SET_VMA)`, among them). No event
 of the class reads a descriptor, and none writes to a descriptor other than 2. -/
 def Event.IsStartup (ev : Event) : Prop :=
-  arg32 ev.nr = 12 ∨ arg32 ev.nr = 9 ∨ arg32 ev.nr = 10 ∨ arg32 ev.nr = 11 ∨ arg32 ev.nr = 158 ∨ arg32 ev.nr = 218 ∨
+  arg32 ev.nr = 12 ∨ arg32 ev.nr = 9 ∨ arg32 ev.nr = 10 ∨ arg32 ev.nr = 11 ∨ arg32 ev.nr = 28 ∨ arg32 ev.nr = 157 ∨ arg32 ev.nr = 158 ∨ arg32 ev.nr = 218 ∨
     arg32 ev.nr = 273 ∨ arg32 ev.nr = 334 ∨ arg32 ev.nr = 302 ∨ arg32 ev.nr = 318 ∨ arg32 ev.nr = 228 ∨
     arg32 ev.nr = 267 ∨
     ((arg32 ev.nr = 20 ∨ arg32 ev.nr = 1) ∧ (ev.args.headD 0).setWidth 32 = 2)
@@ -106,9 +109,9 @@ def _root_.ZellicX86.ExecArgs.envVals (a : ExecArgs) (name : String) : List (Lis
 - `reads`: what its startup reads that it does not write, of the state at its entry (none unless given): the initial
   stack's vectors, the library's data as the executable file loads it (its relocations, `.rela.iplt`, the program
   headers at `AT_PHDR`, the TLS image);
-- `writes`: what its startup may write, of the state at its entry (its stack frame, its data);
+- `writes`: what its startup may write besides its stack frame, of the state at its entry (its data);
 - `stack`: the bytes of stack its startup uses below its entry `rsp`, at most (`CStart.stackRgn`), which a process
-  statement gives room for (`StackRoom`);
+  statement gives room for (`StackRoom`); its stack frame (`frame` of these bytes) it may write;
 - `protects`: the regions whose pages its startup may re-protect, of the state at its entry (none unless given):
   glibc makes its RELRO segment's whole pages read-only after relocating it, from the page of its start up to the page
   of its end, both rounded down (`_dl_protect_relro` in `elf/dl-reloc.c`, called from `elf/dl-support.c`; for example,
@@ -116,9 +119,8 @@ def _root_.ZellicX86.ExecArgs.envVals (a : ExecArgs) (name : String) : List (Lis
   `[ALIGN_DOWN(p_vaddr), ALIGN_DOWN(p_vaddr + p_memsz))`; it may write them as well, but neither unmaps nor remaps
   them (`Layout.protects`, which re-protects only pages wholly in the regions);
 - `exitStack`: the bytes of stack its exit uses below `p` (none unless given);
-- `exitCalls`: the system calls its exit may make besides closing the streams (none unless given). glibc 2.43's, with
-  the tunables its allocator's contracts admit (not `glibc.malloc.hugetlb`, under which a `free` may also `madvise` and
-  read `/sys`): the allocator's memory calls (`Event.IsMemCall`), since its exit's handlers `free` blocks its startup allocated (libgcc's
+- `exitCalls`: the system calls its exit may make besides closing the streams (none unless given). glibc 2.43's: the
+  allocator's memory calls (`Event.IsMemCall`; a `free` makes `madvise` under `glibc.malloc.hugetlb=1`), since its exit's handlers `free` blocks its startup allocated (libgcc's
   `release_registered_frames`, `unwind-dw2-fde.c`), and a `free` may grow the heap (a thread's first `free` sets up its
   cache, `tcache_init`, by a `malloc` that `brk` serves where the top chunk has no room) or give memory back (`systrim`;
   `malloc/malloc.c`);
@@ -162,42 +164,72 @@ def CStart.Holds (L : CStart) (p : Addr) (s : State) : Prop :=
   L.inv (Heap.readBytes (L.own p) s) p
 
 /-- What `main` is called with at the end of the startup of the library `L` from the state `s` at the library's entry
-(`main` in `rdi`, `argc` in `esi`, `argv` in `rdx`), on a processor with features `feat`, for a `main` that uses `k`
-bytes of stack below its entry `rsp`, in a program whose read-only data is `ro` (`roSegments`), the library's runtime at
+(`main` in `rdi`, `argc` in `esi`, `argv` in `rdx`), on a processor with features `feat`, for a `main` that uses `k X`
+bytes of stack below its entry `rsp` when called in `X` (a bound that may depend on its arguments), in a program whose read-only data is `ro` (`roSegments`), the library's runtime at
 the ghost `g`, as the contract whose call that is (`CStart.startup`, `CallOf`): under `sysv`, what the library reads
 without owning it (`Runtime.reads`) and `ro` as memory it may read, the stack below the return address for `main` and
-then the library's exit (`frame X (k + L.exitStack)`), `errno` (which `main`, calling the library, and the exit may set)
+then the library's exit (`frame X (k X + L.exitStack)`), `errno` (which `main`, calling the library, and the exit may set)
 and the regions of the startup's frame the library keeps (`CStart.own` at `X`'s `rsp + 8`, where `main` returns, among
 them the word there) as memory it may write, the library's memory as memory it owns (`Layout.owns g.own`), `argc` in
 `edi`, `argv` in `rsi`, the environment after `argv`'s null pointer in `rdx` (`argv + 8 (argc + 1)`, `argc` an `int`;
-C17 5.1.2.2.1, glibc's `csu/libc-start.c`), the stack apart from the startup's frame, that frame apart from the
-library's memory, what it reads and `errno`, `ro` apart from all `main` and the library may write (not from what the
-library reads: read-only data may be read by both), the frame's invariant (`CStart.Holds`), the runtime ready to be
+C17 5.1.2.2.1, glibc's `csu/libc-start.c`), the stack apart from the startup's frame (and from the rest, as at every
+call: `CallOf`), that frame apart from the library's memory, what it reads and `errno`, `ro` apart from all `main` and
+the library may write (not from what the library reads: read-only data may be read by both), the frame's invariant (`CStart.Holds`), the runtime ready to be
 called from that stack (`Runtime.Ready`), and the stack below the return address and the word above it short of the top
 of the address space (so the exit's stack below where `main` returns does not wrap around). Only what a call's state is
 counts (`CallOf`: the convention, the regions, the precondition); it promises nothing (`post` `True`): what `main` does
 is its own contract's. -/
-def CStart.room (L : CStart) (feat : Features) (k : Nat) (ro : List Rgn) (g : Ghost) (s : State) : Contract where
+def CStart.room (L : CStart) (feat : Features) (k : State → Nat) (ro : List Rgn) (g : Ghost) (s : State) : Contract where
   conv := sysv
   reads X := L.rt.reads X.cpu.seg.fsBase ++ ro
-  writes X := frame X (k + L.exitStack) :: L.rt.errnoLoc X :: L.own (X.cpu.gpr.rsp + 8)
+  stack X := k X + L.exitStack
+  writes X := L.rt.errnoLoc X :: L.own (X.cpu.gpr.rsp + 8)
   pre X :=
     X.cpu.gpr.rdi.setWidth 32 = s.cpu.gpr.rsi.setWidth 32 ∧ X.cpu.gpr.rsi = s.cpu.gpr.rdx ∧
     X.cpu.gpr.rdx = s.cpu.gpr.rdx + 8 * ((s.cpu.gpr.rsi.setWidth 32).signExtend 64 + 1) ∧
-    Apart [frame X (k + L.exitStack)] (L.own (X.cpu.gpr.rsp + 8)) ∧
     (∀ a, (⟨X.cpu.gpr.rsp + 8, 8⟩ : Rgn).Mem a → Foot (L.own (X.cpu.gpr.rsp + 8)) a) ∧
     Apart (L.own (X.cpu.gpr.rsp + 8)) (g.own ++ L.rt.reads X.cpu.seg.fsBase ++ [L.rt.errnoLoc X]) ∧
-    Apart ro (frame X (k + L.exitStack) :: L.rt.errnoLoc X :: (L.own (X.cpu.gpr.rsp + 8) ++ g.own)) ∧
-    L.Holds (X.cpu.gpr.rsp + 8) X ∧ L.rt.Ready feat g (k + L.exitStack) X ∧
-    (⟨X.cpu.gpr.rsp - BitVec.ofNat 64 (k + L.exitStack), k + L.exitStack + 16⟩ : Rgn).Fits
+    Apart ro (L.rt.errnoLoc X :: (L.own (X.cpu.gpr.rsp + 8) ++ g.own)) ∧
+    L.Holds (X.cpu.gpr.rsp + 8) X ∧ L.rt.Ready feat g (k X + L.exitStack) X ∧
+    (⟨X.cpu.gpr.rsp - BitVec.ofNat 64 (k X + L.exitStack), k X + L.exitStack + 16⟩ : Rgn).Fits
   post _ _ := True
   events _ _ _ := True
   layout _ := .owns g.own (movesBrk := true)
 
+/-- The precondition of the startup's contract (`CStart.startup`), one field per part, in the order its docstring lists
+them: `main` canonical; the arguments `execve` started the process with and the initial stack (`args`); the return
+address below `argv`; the segments loaded; the read-only data and the startup's stack apart from what they must be apart
+from; no aliasing; `PKRU`, `rseq`, the program break and the thread id as `execve` leaves them; `L.pre`; the segments'
+pages not fixed; the footprint ordinary memory. The executable's read-only data `ro` and its segments' pages `pages` are
+parameters (`roSegments phs` and `segmentPages phs` in `CStart.startup`). -/
+structure CStart.StartupPre (L : CStart) (prof : Profile) (img : Nat → Byte) (hdr : ElfHeader) (phs : List Phdr)
+    (ro pages : List Rgn) (room : List (Addr × List Byte)) (s : State) : Prop where
+  mainCanonical : Addr.canonical prof.feat.la57 s.cpu.gpr.rdi = true
+  args : ∃ (a : ExecArgs) (IS : List Rgn), s.cpu.gpr.rsi = BitVec.ofNat 64 a.argv'.length ∧
+    InitialStackIn prof s a hdr phs s.cpu.gpr.rdx IS ∧ a.Ok ∧ a.withinLimits = true ∧ L.args a ∧ (∀ r ∈ IS, r.Fits) ∧ NotKernel s IS ∧
+    Apart IS (frame s L.stack :: L.writes s ++ L.protects s ++ pages)
+  argvAbove : s.cpu.gpr.rsp.toNat + 8 ≤ s.cpu.gpr.rdx.toNat
+  loaded : SegmentsLoaded prof.feat s img phs
+  roApart : Apart ro (L.writes s ++ L.statics ++ L.protects s)
+  stackApart : Apart [L.stackRgn s] pages
+  noAlias : ∀ rs, NoAliasOver s rs
+  pkru : s.cpu.pkru &&& 3 = 0
+  noRseq : s.thread.rseq = none
+  brkAligned : s.proc.mm.brk.toNat % 4096 = 0
+  brkPos : 0 < s.proc.mm.brk.toNat
+  brkBelow : s.proc.mm.brk.toNat < 2 ^ 47
+  tidPos : 0 < s.thread.tid
+  tidBelow : s.thread.tid < 2 ^ 32
+  lib : L.pre s
+  notFixed : NotFixed s pages
+  notHuge : ∀ rs, NotHuge s rs
+  foot : (⟨frame s L.stack :: L.writes s, L.statics ++ L.protects s, L.reads s ++ ro, room⟩ : Footprint).Ok
+    prof.feat s
+
 /-- The startup of the library `L` as a contract for `ImplementsCallUpto` (or `ImplementsCallUptoIf`) at
 `__libc_start_main(main, argc, argv, …)` (`main` in `rdi`, `argc` in `rsi`, `argv` in `rdx`), on processor `prof`, in a
 process `execve` started from an executable whose bytes are `img`, whose ELF header is `hdr` and whose program headers
-are `phs`, for a `main` that uses `k` bytes of stack below its entry `rsp`. `room` is the code `main`'s call may run
+are `phs`, for a `main` that uses `k X` bytes of stack below its entry `rsp` when called in `X`. `room` is the code `main`'s call may run
 (`main`'s and its callees': at link time the loaded executable segment, of which `main`'s code is a part), still loaded
 at the call and not aliased by the room's data (`CallOf`). The code the startup itself runs is the code list of its
 `ImplementsCallUpto`, which may be another: one without `main`'s bytes (at link time the loaded executable segment
@@ -228,6 +260,8 @@ Precondition, under `sysv`:
 - `L.pre`;
 - the loadable segments' pages lie in no page of the vDSO and no first page of the stack (`NotFixed`: `execve` maps the
   segments as ordinary private mappings, apart from both; so the runtime may own its static data there);
+- no page is of a mapping of huge pages (`NotHuge` of every list of regions: `execve` maps none and the entry point
+  maps none; so the runtime may re-protect any of its pages);
 - the footprint of `L.writes` written, `L.statics` and `L.protects` owned, `L.reads` and the read-only data read, and
   `room` as code is ordinary memory (`Footprint.Ok`): the code `main`'s call runs is there and can be fetched at the
   startup's entry, apart from what the startup writes and re-protects, as its own code is by its call (`CallOf`).
@@ -246,21 +280,13 @@ no blocks of the program's (some of its own, which its startup and the toolchain
 calls (`Event.IsStartup`). Or it ends the process as `L.startEnds` says. All this on the runs in the environment
 `L.env` admits. With `ImplementsCallUptoIf`, the startup need not get to that call: at every point it has reached it,
 has made only a startup's system calls so far, or has ended the process as `L.startEnds` says. -/
-def CStart.startup (L : CStart) (prof : Profile) (img : Nat → Byte) (hdr : ElfHeader) (phs : List Phdr) (k : Nat)
+def CStart.startup (L : CStart) (prof : Profile) (img : Nat → Byte) (hdr : ElfHeader) (phs : List Phdr) (k : State → Nat)
     (room : List (Addr × List Byte)) : Contract where
   conv := sysv
+  stack := fun _ => L.stack
   reads s := L.reads s ++ roSegments phs
   writes := L.writes
-  pre s := Addr.canonical prof.feat.la57 s.cpu.gpr.rdi = true ∧
-    (∃ (a : ExecArgs) (IS : List Rgn), s.cpu.gpr.rsi = BitVec.ofNat 64 a.argv'.length ∧
-      InitialStackIn prof s a hdr phs s.cpu.gpr.rdx IS ∧ a.Ok ∧ a.withinLimits = true ∧ L.args a ∧ (∀ r ∈ IS, r.Fits) ∧ NotKernel s IS ∧
-      Apart IS (L.writes s ++ L.protects s ++ segmentPages phs)) ∧
-    s.cpu.gpr.rsp.toNat + 8 ≤ s.cpu.gpr.rdx.toNat ∧ SegmentsLoaded prof.feat s img phs ∧
-    Apart (roSegments phs) (L.writes s ++ L.statics ++ L.protects s) ∧ Apart [L.stackRgn s] (segmentPages phs) ∧
-    (∀ rs, NoAliasOver s rs) ∧ s.cpu.pkru &&& 3 = 0 ∧ s.thread.rseq = none ∧
-    s.proc.mm.brk.toNat % 4096 = 0 ∧ 0 < s.proc.mm.brk.toNat ∧ s.proc.mm.brk.toNat < 2 ^ 47 ∧
-    0 < s.thread.tid ∧ s.thread.tid < 2 ^ 32 ∧ L.pre s ∧ NotFixed s (segmentPages phs) ∧
-    (⟨L.writes s, L.statics ++ L.protects s, L.reads s ++ roSegments phs, room⟩ : Footprint).Ok prof.feat s
+  pre s := CStart.StartupPre L prof img hdr phs (roSegments phs) (segmentPages phs) room s
   post s X := ∃ own libLive : List Rgn,
     (∀ a, Foot own a → Foot L.statics a ∨ s.proc.mm.mem.map (pageOf a) = none) ∧
     CallOf prof s.cpu.gpr.rdi room (L.room prof.feat k (roSegments phs) { own, libLive, streams := L.rt.initial } s) X
@@ -299,7 +325,8 @@ is taken. -/
 def CStart.exit (L : CStart) (feat : Features) (g : Ghost) : Contract where
   conv := sysv
   reads s := L.rt.reads s.cpu.seg.fsBase
-  writes s := frame s L.exitStack :: L.rt.errnoLoc s :: L.own s.cpu.gpr.rsp
+  stack := fun _ => L.exitStack
+  writes s := L.rt.errnoLoc s :: L.own s.cpu.gpr.rsp
   pre s := s.cpu.gpr.rsp.toNat % 16 = 0 ∧ s.cpu.rflags.df = false ∧ s.cpu.x87.full = 0 ∧
     L.Holds s.cpu.gpr.rsp s ∧ (∀ a, (⟨s.cpu.gpr.rsp, 8⟩ : Rgn).Mem a → Foot (L.own s.cpu.gpr.rsp) a) ∧
     Apart (L.own s.cpu.gpr.rsp) (g.own ++ L.rt.reads s.cpu.seg.fsBase ++ [L.rt.errnoLoc s]) ∧

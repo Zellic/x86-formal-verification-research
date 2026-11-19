@@ -27,7 +27,7 @@ roots = ["Examples.Memcmp.Code", "Examples.Memcmp.Spec", "Examples.Memcmp.Statem
 [[lean_lib]]
 name = "Glibc243Ubuntu"
 srcDir = "glibc-2.43-ubuntu-26.04-amd64"
-roots = ["Glibc243Ubuntu.Heap.MemGranted", "Glibc243Ubuntu.TunablesEnv"]
+roots = ["Glibc243Ubuntu.Heap.MemGranted", "Glibc243Ubuntu.LibcA", "Glibc243Ubuntu.MemrchrFixedObjs", "Glibc243Ubuntu.MemrchrStatement", "Glibc243Ubuntu.TunablesEnv"]
 
 [[lean_lib]]
 name = "Glibc243UbuntuClients"

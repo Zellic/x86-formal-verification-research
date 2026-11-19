@@ -147,10 +147,12 @@ def NoTunables (envp : List (List Byte)) : Prop :=
 
 /-- **Demonstration carve-out**: the launches of the demonstration, `a` the arguments, environment and credentials
 `execve` started the process with: not secure (`AT_SECURE` 0: no set-user-ID or set-group-ID file, no file
-capabilities), no tunables set (`NoTunables`), no `LD_LIBRARY_PATH`. With every tunable
+capabilities), no tunables set (`NoTunables`), no `LD_LIBRARY_PATH`, and `RLIMIT_AS` and `RLIMIT_DATA` unlimited (as the
+allocator's environment assumes at every call, `LimitsUnlimited`: `execve` gives the process the launch's limits). With every tunable
 at its default, the theorems need no hypothesis about the tunables' values. -/
 def DemoArgs (a : ExecArgs) : Prop :=
-  a.secure = false ∧ NoTunables a.envp ∧ a.envVals "LD_LIBRARY_PATH" = []
+  a.secure = false ∧ NoTunables a.envp ∧ a.envVals "LD_LIBRARY_PATH" = [] ∧
+    (a.signal.rlimits RLIMIT_AS).cur = RLIM_INFINITY ∧ (a.signal.rlimits RLIMIT_DATA).cur = RLIM_INFINITY
 
 /-! ## The kernel's vDSO -/
 

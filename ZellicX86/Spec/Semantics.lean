@@ -7,6 +7,7 @@ import ZellicX86.Spec.Semantics.String
 import ZellicX86.Spec.Semantics.Bits
 import ZellicX86.Spec.Semantics.Avx
 import ZellicX86.Spec.Semantics.Lock
+import ZellicX86.Spec.Semantics.Xsave
 import ZellicX86.Spec.Semantics.X87
 /-!
 # Instruction semantics
@@ -61,6 +62,7 @@ def exec (prof : Profile) (i : Inst) : Prog Ctl :=
   | .movbe => Sem.movbe i | .prefetch _ => Sem.prefetch i | .crc32 => Sem.crc32 i
   | .lfence => Sem.lfence i | .sfence => Sem.sfence i | .mfence => Sem.mfence i
   | .rdssp => Sem.rdssp i | .incssp => Sem.incssp i | .xtest => Sem.xtest i
+  | .xsave => Sem.xsave false prof i | .xsavec => Sem.xsave true prof i | .xrstor => Sem.xrstor prof i
   | .rcl | .rcr | .pause => unmodelled (.form (reprStr i.mn))
 
 end ZellicX86

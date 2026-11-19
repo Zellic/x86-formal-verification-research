@@ -176,4 +176,26 @@ def userPath (prof : Profile) (s : State) (a : Addr) : Req (State × Except Nat 
       Pure.pure (s, .ok (readBytes s.proc.mm.mem a j))
     | _ => Pure.pure (s, .error EFAULT)
 
+/-- Where the string at `a` ends within `max` bytes, as `pathEnd` within `PATH_MAX`: the offset of the first byte that
+is a NUL, cannot be read by the kernel, or lies at or above `TASK_SIZE_MAX`, with `true` if that byte is readable (then
+a NUL) and `false` otherwise; `none` if no such byte lies within `max`. -/
+def userStrEnd (feat : Features) (s : State) (a : Addr) (max : Nat) : Option (Nat × Bool) :=
+  let ok (i : Nat) : Bool := decide (a.toNat + i < userPtrMax feat) && (kernelRead feat s (a.add i) 1).isSome
+  ((List.range max).find? fun i => !ok i || s.proc.mm.mem.readByte (a.add i) == 0).map fun i => (i, ok i)
+
+/-- A string of at most `max` bytes with its NUL, read from the process's memory at `a` as `strndup_user (a, max)` reads
+it (`mm/util.c`, `lib/strnlen_user.c`): the bytes up to the first NUL, which must come within `max` bytes (else
+`EINVAL`); a byte up to it that the kernel cannot read, or that lies at or above `TASK_SIZE_MAX`, gives `EFAULT`. With
+the state after the stack growths of the reads (`growFor`), as `userPath`: a byte on a page where the kernel grows a
+stack is a 0 of the grown page and ends the string. `strnlen_user` reads aligned words of 8 bytes, which lie on the
+pages of the string's bytes, so the bytes it touches beyond them grow nothing more. -/
+def userStr (prof : Profile) (s : State) (a : Addr) (max : Nat) : Req (State × Except Nat (List Byte)) :=
+  match userStrEnd prof.feat s a max with
+  | none => Pure.pure (s, .error EINVAL)
+  | some (i, _) => do
+    let s ← growFor prof s .read a (i + 1)
+    match userStrEnd prof.feat s a max with
+    | some (j, true) => Pure.pure (s, .ok (readBytes s.proc.mm.mem a j))
+    | _ => Pure.pure (s, .error EFAULT)
+
 end ZellicX86

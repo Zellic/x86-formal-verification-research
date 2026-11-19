@@ -1,9 +1,10 @@
 # Verified x86-64 Linux binaries: statements and checkable proofs
 
-This repository states, in Lean 4, theorems about machine code as it runs under Linux on x86-64: compiled C functions and
-statically linked programs, taken as binaries (the bytes the compiler and linker produced, not their source). It
+This repository states, in Lean 4, theorems about machine code as it runs under Linux on x86-64: compiled C
+functions, functions of glibc's static library and statically linked programs, taken as binaries (the bytes the
+compiler and linker produced, not their source). It
 carries the theorems' **statements** as Lean source, and their **proofs** as exported Lean terms that anyone can check
-with Lean's kernel. The tools that produced the proofs are not part of this release (see "How the proofs were made").
+with Lean's kernel. The tools that produced the proofs are not part of this repository (see "How the proofs were made").
 
 Every theorem is about one binary or function and says what it does on every run its hypotheses admit: for a
 function, its result, the memory it may write and that it makes no system call; for a program, what it
@@ -14,15 +15,15 @@ rests on three things, all in this repository or in Lean itself:
    memory, faults) and the Linux process around it (`execve`'s initial state, system calls, signals as far as
    modelled). It also holds the vocabulary the statements are written in (contracts, `ImplementsCall`, `Always`,
    `EndsIf`, …). Anything the model does not cover ends in an explicit "not modelled" outcome, and every theorem
-   here proves that its runs never reach one. (A launch at which the model's `execve` itself is not modelled is
+   here (but `evexBug`, a negation: below) proves that its runs never reach one. (A launch at which the model's `execve` itself is not modelled is
    outside the theorems' hypotheses.) `MODEL-LIMITATIONS.md` says where the model stops. It also names the few places
    where the model, instead of leaving a choice open, follows the behaviour observed on the processor it was checked
    against.
-2. **The statements** (`Examples/*/Statement.lean`, `glibc-2.43-ubuntu-26.04-amd64/Glibc243UbuntuClients/*/`): each
+2. **The statements** (`Examples/Memcmp/Statement.lean`, `glibc-2.43-ubuntu-26.04-amd64/Glibc243Ubuntu/MemrchrStatement.lean`, `glibc-2.43-ubuntu-26.04-amd64/Glibc243UbuntuClients/*/Statement.lean`): each
    theorem's proposition, with the definitions it uses.
 3. **The loader** (`ZellicX86/Load/FileImage.lean`): `#file_image "path" sha256 "…"` reads a binary into Lean
-   constants and refuses it unless its SHA-256 is the one written in the source, so a statement about a program is
-   about exactly that file.
+   constants and refuses it unless its SHA-256 is the one written in the source, so a statement about a program (or
+   about an object of a library archive) is about exactly that file.
 
 ## Status: a research preview
 
@@ -44,6 +45,13 @@ far have broadly been of two kinds:
 | theorem | binary | in short |
 |---|---|---|
 | `Memcmp.gccO1_holds`, `gccO2_holds`, `gccOs_holds`, `clangO2_holds`, `clangOs_holds` (each `Memcmp.holds` of its build, `Examples/Memcmp/Statement.lean`; the theorems are named in `ReleaseChallenges/`) | `memcmp.c` compiled by GCC 15 (`-O1`, `-O2`, `-Os`) and Clang 21 (`-O2`, `-Os`): `Examples/Memcmp/Code.lean` | each build, placed at any address, implements C's `memcmp` on every processor. |
+| `Glibc243Ubuntu.Memrchr.evex_holds` (`Glibc243Ubuntu.Memrchr.evexHolds`, `glibc-2.43-ubuntu-26.04-amd64/Glibc243Ubuntu/MemrchrStatement.lean`) | `__memrchr_evex` as the object `memrchr-evex.o` of Ubuntu 26.04's `libc.a` (`glibc-2.43-ubuntu-26.04-amd64/libc.a`) | at every link of the object, the function implements `memrchr` (the address of the last byte equal to `c` among the `n` bytes at `s`, or null) **for `n < 2^32`**, on every processor with AVX-512F/VL/BW, LZCNT and BMI2. Without the bound it does not implement `memrchr` (`evexBug`, below). |
+| `Glibc243Ubuntu.Memrchr.avx2_holds` (`avx2Holds`, the same file) | `__memrchr_avx2`, the object `memrchr-avx2.o` of `libc.a` | at every link, it implements `memrchr` **for objects at or past address 32**, on every processor with AVX, AVX2, LZCNT and BMI2. Below address 32, with page 0 mapped, the code can return `(void *) -1` where the byte does not occur: found when the proof's last failing obligations pointed at it, confirmed by reading the code and by running it under qemu-user with page 0 mapped; not proved here. |
+| `Glibc243Ubuntu.Memrchr.avx2Rtm_holds` (`avx2RtmHolds`) | `__memrchr_avx2_rtm`, the object `memrchr-avx2-rtm.o` of `libc.a` | as `__memrchr_avx2`, on every processor with AVX, AVX2, LZCNT, BMI2 and RTM. |
+| `Glibc243Ubuntu.Memrchr.sse2_holds` (`sse2Holds`) | `__memrchr_sse2`, the object `memrchr-sse2.o` of `libc.a` | at every link, it implements `memrchr` for every call, on every processor; a call with `n = 0` where `s` is not in a page's first 16 bytes must have the 16 bytes before `s` readable (the code reads them there, `sse2Reads`). |
+| `Glibc243Ubuntu.Memrchr.evexFixed_holds` (`evexFixedHolds`) | `__memrchr_evex` with a one-instruction fix (`glibc-2.43-ubuntu-26.04-amd64/fixed/memrchr-evex.patch`), as the object `fixed/memrchr-evex-fixed.o` | at every link, it implements `memrchr` for every call, on the same processors. |
+| `Glibc243Ubuntu.Memrchr.avx2Fixed_holds` (`avx2FixedHolds`) | `__memrchr_avx2` with a fix: a `jb` to the null return after each of the three subtractions that can borrow (`fixed/memrchr-avx2.patch`), as the object `fixed/memrchr-avx2-fixed.o` | at every link, it implements `memrchr` for every object, on the same processors. |
+| `Glibc243Ubuntu.Memrchr.evexBug_holds` (`evexBug`) | `__memrchr_evex` as `libc.a` ships it | it does **not** implement `memrchr` for every call (`¬ FnHolds …`; beside `evexHolds`, which says every link places the function, this is about the code). The statement says no more than that; its proof exhibits a call that fails: on an object of exactly `2^32` bytes whose last byte lies in the first 32 bytes of a page and is the byte looked for, the code returns the address one byte before the object. So `evexHolds`' bound `n < 2^32` is needed, and the fix above removes a real bug. |
 | `Clients.Admin.holds`, proved by `Clients.Admin.holds_proof` (`Glibc243UbuntuClients/Admin/Statement.lean`; the proof is the export) | `clients/admin`, a small C program (`clients/admin.c`; these paths under `glibc-2.43-ubuntu-26.04-amd64/`) statically linked against glibc 2.43 | under the hypotheses below, the program never reports an admin: its standard output is always a first part of `Hello, <name>! admin: no` and a newline. |
 | `Clients.Admin2.holds`, proved by `Clients.Admin2.holds_proof` (`Glibc243UbuntuClients/Admin2/Statement.lean`) | `clients/admin2` (`clients/admin2.c`): admin, but it rejects a name that contains a newline, and writes its answer as two lines | as admin, but the output is a first part of the two lines `Hello, <name>!` and `admin: no`, and a name with a newline is rejected. |
 
@@ -66,6 +74,33 @@ that the sign of the result is the order of the two byte strings, for every leng
 and writes nothing but its return address's slot (and the ids the kernel itself writes into the thread's `rseq` area,
 if it has one, at every return to user mode).
 
+### glibc's `memrchr`: the variants, their carve-outs and the fixes
+
+glibc has four implementations of `memrchr` for x86-64, and a resolver that picks one of them when a program starts,
+from the processor's features. Every `memrchr` theorem here has one form (`FnHolds o "fn" needs C`,
+`ZellicX86/Spec/Executable.lean`): the function `fn` of the object `o`, placed at whatever address a link gives it
+(`Obj.linkedFn` over every `Link`). It states, first, that every link does place the function (the object has the
+function, and the function has no relocation whose application a link could refuse), so that the rest is about real
+code; then, at every
+link, in any code holding the function's bytes where the link puts them, on every processor with the features
+`needs`, that the code implements the contract `C`. The contract is `memrchr`'s (`C.memrchr`,
+`ZellicX86/Spec/Lib/C/String.lean`) or the same with a variant's carve-out, both named at their use
+(`C.memrchrWith (pre := …) (alsoReads := …)`): `pre` narrows the calls covered, `alsoReads` lets the code read more
+than the object. The four variants' objects are those of Ubuntu 26.04's `libc.a`, by that file's SHA-256; the carve-outs
+are named in the statement file (`evexOk`, `avx2Ok`, `sse2Reads`):
+
+| variant | carve-out | why | fixed theorem |
+|---|---|---|---|
+| `__memrchr_evex` | `pre := evexOk`: `n < 2^32` | a 32-bit length computation on its page-crossing path returns an address a multiple of 4 GiB too low (`evexBug`: without the carve-out the code does not implement `memrchr`) | `evexFixedHolds`: every call |
+| `__memrchr_avx2`, `__memrchr_avx2_rtm` | `pre := avx2Ok`: the object starts at or past address 32 | below, where page 0 is mapped (`vm.mmap_min_addr` 0, or `CAP_SYS_RAWIO`), an address computation wraps and the code returns `(void *) -1` for a byte that does not occur | `avx2FixedHolds` (`__memrchr_avx2`): every call |
+| `__memrchr_sse2` | `alsoReads := sse2Reads`: a call with `n = 0` where `s mod 4096 ≥ 16` needs the 16 bytes before `s` to be ordinary readable memory, as the object's bytes must be (`Contract.probes`) | the code reads them exactly there (its own page test; glibc's source says so) and ignores them; not a wrong result | none needed |
+
+Each fixed theorem is its variant's statement with the object replaced and the carve-out dropped: the object is the
+variant built from glibc's source with the fix (`glibc-2.43-ubuntu-26.04-amd64/fixed/memrchr-*.patch`; `fixed/build.sh`
+assembles each as glibc's build does and checks that the same build without the patch gives the function's bytes in `libc.a`'s object; the
+statement file loads the objects from `fixed/` by their SHA-256). There is no fixed `__memrchr_avx2_rtm` theorem. The patches are ours;
+glibc 2.43 does not have them.
+
 ### The programs' theorems
 
 They are stated with `Always` (what holds at every point of every run) and `EndsIf` (that every run that reaches a
@@ -79,7 +114,7 @@ given point ends, and how). For admin, on every launch and run the hypotheses ad
   them reads a descriptor, and none writes to one but standard error).
 - **From `main` on.** If the process reaches `main`, it ends, in one of the ways `Done` lists:
   - exit 0, having written the whole line;
-  - exit 1, after a failed or short `read` or `write`;
+  - exit 1, after a failed `read` or `write`, or a short `write`;
   - exit 2, having read and written nothing (`main`'s path when a `malloc` returns null);
   - killed by `SIGPIPE` or `SIGXFSZ` (a `write` to a pipe without readers, or past the file size limit).
 
@@ -109,10 +144,19 @@ The assumptions are hypotheses in the statements themselves. Each is a named def
   - a thread without single-stepping, alignment checking, a user shadow stack, `CPUID` faulting or an active `rseq`
     critical section (`Ready`);
   - both strings readable, apart from the return address's slot and the code;
-  - both strings on ordinary pages (`Footprint.Ok`): not the vDSO's data or lazily freed pages, and no page of them
-    aliased through another virtual page;
+  - both strings on ordinary pages (`Footprint.Ok`): not the vDSO's data or lazily freed pages, and no two of the
+    call's pages (the strings', the return address's slot's, the code's) backed by the same memory;
   - the run undisturbed.
-- **admin and admin2.** Each statement has the same hypotheses, except `DemoLimits`, which only admin's has.
+- **`memrchr`**: the same kind of call, and the processor features the code uses (AVX-512F/VL/BW, LZCNT and BMI2
+  for `__memrchr_evex` and its fix; AVX, AVX2, LZCNT and BMI2 for `__memrchr_avx2` and its fix, and RTM besides for
+  `__memrchr_avx2_rtm`; none for `__memrchr_sse2`). glibc's resolver selects a variant only where its feature words
+  mark these usable or, by `init_cpu_features`' promise, imply them (AVX-512F from AVX-512VL, AVX from AVX2).
+  Each function at every link of its object (`libc.a`'s member, or the fixed object).
+- **The bug** (`evexBug`) assumes nothing: it is the negation of the fixed variant's statement for the shipped object.
+  `FnHolds` asks every link to place the function, which a function with a relocation a link can overflow never meets;
+  `__memrchr_evex` has none, and `evexHolds` proves that every link places it, so the negation is about the code.
+- **admin and admin2.** Each statement has the same hypotheses; admin's also has `DemoLimits`, which `DemoArgs` implies
+  wherever `0x800000 + pageUp (8 + strings) ≤ 2^64 - 1` (every real launch).
   - **Any start.** Every start `execve` can give the program (`Launch.Of`): any arguments, environment and
     credentials a caller can pass; any kernel configuration and any choice the kernel can make; any open descriptors,
     signal mask and dispositions.
@@ -122,14 +166,15 @@ The assumptions are hypotheses in the statements themselves. Each is a named def
     argument and environment strings.
   - **The launch** (`DemoArgs`). Not a secure exec (`AT_SECURE` 0: no set-user-ID or set-group-ID file, no file
     capabilities). No environment string setting `GLIBC_TUNABLES` or one of the tunables' nine aliases. No
-    `LD_LIBRARY_PATH`.
+    `LD_LIBRARY_PATH`. The soft `RLIMIT_AS` and `RLIMIT_DATA` unlimited (`RLIM_INFINITY`).
   - **admin's limits** (`DemoLimits`, admin only). A soft `RLIMIT_DATA` of at least 4 MiB, and a soft `RLIMIT_AS` of
-    at least 8 MiB above the strings. The proof does not need it. It keeps the covered launches within what the real
-    kernel allows (see `Heap.MemGranted` below).
+    at least 8 MiB above the strings. `DemoArgs`'s unlimited limits imply it (for any strings below about `2^64` less 8 MiB);
+    it is kept from release 1, whose `DemoArgs` did not fix the limits.
   - **The processor** (`ThisProcessor`). Every CPU answers the `CPUID` queries glibc's startup makes as the
     development machine's virtual CPU does, hypervisor bit and topology included, but for the APIC ids and the L3
-    size. That machine is a KVM guest on an AMD Ryzen 9 7950X3D; a bare-metal processor does not meet this. So the
-    theorems cover the paths glibc takes on that CPU.
+    size. The vendor AMD, the same state components enabled in `XCR0` (`0x2e7`) and `AT_HWCAP2` 2 (`FSGSBASE`). That
+    machine is a KVM guest on an AMD Ryzen 9 7950X3D; a bare-metal processor does not meet this. So the theorems cover
+    the paths glibc takes on that CPU.
   - **The vDSO** (`ThisVdso`). The vDSO is the code and data the kernel maps into every process. The hypothesis: the
     kernel maps none, or one whose two pages begin with the development kernel's ELF tables. Its code is not
     assumed, and no theorem here assumes a contract of it. glibc's startup reads these tables, as it reads `CPUID`.
@@ -140,9 +185,8 @@ The assumptions are hypotheses in the statements themselves. Each is a named def
       there);
     - the kernel grants every memory request the model leaves to the environment (`Heap.MemGranted`). No refusal
       for want of memory, nor for the process's own `RLIMIT_DATA`, `RLIMIT_AS` or `RLIMIT_MEMLOCK`,
-      `vm.max_map_count` or the security module. (A request for pages that are not free still fails.) So for a
-      launch whose limits are too small for the program, the theorem covers no real run. admin's `DemoLimits` leaves
-      those launches out; admin2's statement does not.
+      `vm.max_map_count` or the security module. (A request for pages that are not free still fails.) The launch's
+      own `RLIMIT_AS` and `RLIMIT_DATA` are unlimited (`DemoArgs`).
   - **Liveness** ("it ends") is relative to the model, in which every system call returns. A `read` that would block
     for ever is not covered.
   - **No contract of a library.** Every function the programs run, glibc's and libgcc's included, runs from the
@@ -160,67 +204,89 @@ Lean's `lake comparator` checks that the solution proves exactly the challenge's
 You need:
 
 - [elan](https://github.com/leanprover/elan), Lean's toolchain manager (on Linux:
-  `curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh`), with the toolchains
-  `leanprover/lean4:v4.34.0` (the statements') and `leanprover/lean4:v4.35.0` (its `lake comparator` and kernels):
-  `elan toolchain install leanprover/lean4:v4.34.0 leanprover/lean4:v4.35.0` (≈ 6 GB of disk together);
-- `git`, `curl`, `zstd`, `sha256sum`;
+  `curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh`), with the toolchain
+  `leanprover/lean4:v4.35.0`, which builds the statements and ships the exporter, `lake comparator` and the
+  independent kernels: `elan toolchain install leanprover/lean4:v4.35.0` (≈ 3 GB of disk);
+- `git`, `curl`, `zstd`, `sha256sum`, `dpkg-deb`, `tar`;
 - for the comparator's sandbox, `bwrap` with unprivileged user namespaces (see "Environment" below);
 - optionally, Rust's `cargo`, to build a newer nanoda (see "Independent kernels").
 
-0. **The exporter**, once, beside this repository (it builds with Lean 4.34, its own `lean-toolchain`), at the commit
-   of its tag `v4.34.0`:
+0. **The exporter** is Lean 4.35's own, `leanexport` in the toolchain's `bin` directory. All commands here run in this
+   repository's checkout, and name it by a shell variable:
 
-       (git clone https://github.com/leanprover/lean4export ../lean4export && cd ../lean4export &&
-          git checkout --detach 076e8e57707e813375e8f9da8bf989799ace9680 && lake build)
+       exporter="$(elan run leanprover/lean4:v4.35.0 lean --print-prefix)/bin/leanexport"
 
-   The parentheses run the command in a subshell, so its `cd` does not change your shell's directory; step 2 uses
-   them the same way. All commands here run in this repository's checkout, and take the exporter at
-   `../lean4export/.lake/build/bin/lean4export`.
 1. **The statements elaborate and the binaries are the ones named:**
+
+   First obtain the library input (it is downloaded separately from this repository):
+
+       bash get-libc.sh
+
+   This downloads Ubuntu 26.04's `libc6-dev` **2.43-2ubuntu2.4 (amd64)** from the permanent
+   `https://launchpadlibrarian.net/875753672/libc6-dev_2.43-2ubuntu2.4_amd64.deb` URL pinned in the script,
+   checks the package's SHA-256 and package/version/architecture, and extracts only
+   `usr/lib/x86_64-linux-gnu/libc.a` to `glibc-2.43-ubuntu-26.04-amd64/libc.a`.
+   Its SHA-256 must be `2a277b999268f100c5f838689704b7432e9b1fdac76bf0cbda83cdbbaecc89e2`.
+   The package's SHA-256 is `17bb816a65a25c3416854eef7e9cc6d9a3761f45bad0d44e49bc676b7bab1769`.
+
+   An offline copy of that exact archive works too:
+
+       bash get-libc.sh --archive /path/to/libc.a
+
+   This verifies the same archive checksum before placing the input. Then run:
 
        lake build
 
    builds the model and every statement's proposition with Lean only (no dependency, no download; the theorems
-   themselves are stated by the challenges, step 2), and `#file_image` checks each program's SHA-256, printing one
-   `info:` line per file with its size. The functions' bytes are written out in `Examples/*/Code.lean` instead (see
+   themselves are stated by the challenges, step 2), and `#file_image` checks each binary's SHA-256 (the programs',
+   `libc.a`'s, the fixed `memrchr` objects'), printing one `info:` line per file with its size. The other functions' bytes are written out in
+   `Examples/*/Code.lean` instead (see
    "Trust base"). It takes a few minutes at most, and under 2 GB of memory.
 2. **The proofs.** Download the proof exports (`ID.solution.ndjson.zst`, one per theorem id:
    `memcmp-gcc-o1`, `memcmp-gcc-o2`, …; `ls checks` lists the ids) from
-   `https://research-assets.zellic.io/x86fv/proofs/` into `exports/`, and check them against the checksums this
+   `https://research-assets.zellic.io/x86fv/proofs/release-2/` into `exports/`, and check them against the checksums this
    repository carries (`exports/SHA256SUMS`). The files:
 
-   - <https://research-assets.zellic.io/x86fv/proofs/memcmp-gcc-o1.solution.ndjson.zst>
-   - <https://research-assets.zellic.io/x86fv/proofs/memcmp-gcc-o2.solution.ndjson.zst>
-   - <https://research-assets.zellic.io/x86fv/proofs/memcmp-gcc-os.solution.ndjson.zst>
-   - <https://research-assets.zellic.io/x86fv/proofs/memcmp-clang-o2.solution.ndjson.zst>
-   - <https://research-assets.zellic.io/x86fv/proofs/memcmp-clang-os.solution.ndjson.zst>
-   - <https://research-assets.zellic.io/x86fv/proofs/admin.solution.ndjson.zst>
-   - <https://research-assets.zellic.io/x86fv/proofs/admin2.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memcmp-gcc-o1.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memcmp-gcc-o2.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memcmp-gcc-os.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memcmp-clang-o2.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memcmp-clang-os.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memrchr-evex.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memrchr-avx2.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memrchr-avx2-rtm.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memrchr-sse2.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memrchr-evex-fixed.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memrchr-avx2-fixed.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/memrchr-evex-bug.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/admin.solution.ndjson.zst>
+   - <https://research-assets.zellic.io/x86fv/proofs/release-2/admin2.solution.ndjson.zst>
 
    The same with `curl` and the check:
 
        (cd exports && for f in $(awk '{print $2}' SHA256SUMS); do
-          curl -fLO "https://research-assets.zellic.io/x86fv/proofs/$f"; done)
+          curl -fLO "https://research-assets.zellic.io/x86fv/proofs/release-2/$f"; done)
        (cd exports && sha256sum -c --ignore-missing SHA256SUMS)
 
    Then, for one id (`memcmp-gcc-o1` here):
 
        ln -f exports/memcmp-gcc-o1.solution.ndjson.zst checks/memcmp-gcc-o1/solution.ndjson.zst
-       bash checks/memcmp-gcc-o1/verify-source.sh . ../lean4export/.lake/build/bin/lean4export
+       bash checks/memcmp-gcc-o1/verify-source.sh . "$exporter"
 
-   (`ln -f` puts the export beside the check's script without a second copy; `cp` works as well) or for every id:
+   (`ln -f` puts the export beside the check's script without a second copy; `cp` works as well; the parentheses
+   above run a command in a subshell, so that its `cd` does not change your shell's directory) or for every id:
 
        opts=""   # --inadvisably-no-sandbox where the sandbox cannot run: see "Environment"
        failed=""
        for id in $(ls -r checks); do   # (reverse order: the quick checks of functions first)
          ln -f exports/$id.solution.ndjson.zst checks/$id/solution.ndjson.zst &&
-           bash checks/$id/verify-source.sh . ../lean4export/.lake/build/bin/lean4export $opts || failed="$failed $id"
+           bash checks/$id/verify-source.sh . "$exporter" $opts || failed="$failed $id"
        done
        if [ -n "$failed" ]; then echo "FAILED:$failed"; false; else echo "all passed"; fi
 
    (it ends non-zero if any check failed or any export is missing)
 
-   `verify-source.sh` builds the theorem's challenge (in `ReleaseChallenges/`) with Lean 4.34 and exports it. Then
+   `verify-source.sh` builds the theorem's challenge (in `ReleaseChallenges/`) with Lean 4.35 and exports it. Then
    it runs Lean 4.35's `lake comparator` on that challenge and the downloaded proof export, configured by
    `checks/ID/comparator.json`. The comparator accepts only if:
 
@@ -238,12 +304,16 @@ You need:
    it names are "complete in the solution, but `sorry` in the challenge"). The proof comes from the export. A proof
    that used `sorry` would be rejected: `sorry` is an axiom (`sorryAx`) that the configuration does not permit.
 
-   Time and memory, on one core:
+   Time and memory, as measured on the development machine (2026-11-12, one check at a time):
 
-   - the functions: a few minutes at most in all (each `memcmp` build ≈ 20 s), under 1.5 GB of memory; their exports are a few MB
-     each;   - admin and admin2: 45 to 60 minutes each, and ≈ 14 GB of free memory (the comparator's peak is 13.4 GB, almost
-     all of it the kernels' replay of the proof). con-leche and con-ron take a few minutes each. Lean's own kernel
-     runs last and takes most of the time (≈ 38 minutes in one reader's run), printing nothing until its verdict;   - disk: the toolchains (≈ 6 GB) and the exporter (≈ 0.25 GB); the downloads (≈ 1.1 GB in all);
+   - the functions: about 17 minutes in all, under 2 GB of memory (the largest process's peak): each `memcmp` build
+     about 20 s, the `memrchr` theorems
+     under 4 minutes each; their exports are 4 to 50 MB each;
+   - admin and admin2: about 48 and 44 minutes, and ≈ 12.5 GB of free memory (the whole check's peak, 8.7 to 12.5 GB
+     in the runs of 2026-11-08 to 11-12).
+     con-leche and con-ron take a few minutes each. Lean's own kernel runs last and takes most of the time, printing
+     nothing until its verdict;
+   - disk: the toolchain (≈ 3 GB); the downloads (≈ 1.25 GB in all);
      and the export being checked, uncompressed while it is checked and removed after (≈ 4.5 GB for
      admin or admin2).
 
@@ -257,7 +327,7 @@ exit status 1. No kernel has actually run: that is the environment, not the proo
 `verify-source.sh` the comparator's option to run without the sandbox (in the loop above:
 `opts="--inadvisably-no-sandbox"`):
 
-    bash checks/ID/verify-source.sh . /path/to/lean4export --inadvisably-no-sandbox
+    bash checks/ID/verify-source.sh . "$exporter" --inadvisably-no-sandbox
 
 This runs the same checks, Lean's kernel included, without the sandbox. The comparator then prints `WARNING:
 Sandbox disabled, this run is not trustworthy.` What the option gives up is the sandbox's protection of your machine
@@ -279,15 +349,14 @@ steps by hand, or with your own challenge, without trusting anything of ours but
       # DIR/MyCh.lean:  import Examples.Memcmp.Statement
       #                 theorem Memcmp.gccOs_holds : Memcmp.holds Memcmp.gccOs := by sorry
       lake env lean --root=DIR -o DIR/MyCh.olean DIR/MyCh.lean
-- **Its export.** `lake env /path/to/lean4export MODULE -- THEOREM <the constants the script names>` exports the
+- **Its export.** `lake env "$exporter" MODULE -- THEOREM <the constants the script names>` exports the
   theorem's statement, and every constant it mentions, from the modules Lean built from this repository's source.
-  For a module of your own in `DIR`: `lake env sh -c 'LEAN_PATH=DIR:$LEAN_PATH exec /path/to/lean4export MyCh -- …'`.
+  For a module of your own in `DIR`: `lake env sh -c "LEAN_PATH=DIR:\$LEAN_PATH exec $exporter MyCh -- …"`.
   The further constants the script names are those the kernel treats specially (`Nat`'s operations, the
   constructors of `String` and `Char` literals, `eagerReduce`), the auxiliary constants Lean's elaborator inserts
   (`optParam`, `autoParam`, …) and the permitted axioms, which `lake comparator` requires both exports to contain.
-  `lean4export`
-  is the Lean project's exporter ([leanprover/lean4export](https://github.com/leanprover/lean4export), tag
-  `v4.34.0`, commit `076e8e5`).
+  `leanexport` is the Lean project's exporter ([leanprover/lean4export](https://github.com/leanprover/lean4export)),
+  as Lean 4.35 ships it.
 - **The judgment.** `lake comparator --challenge-from-export CHALLENGE --solution-from-export SOLUTION`, in a directory
   with a `comparator.json` of your own: `challenge_module` and `solution_module` are module names, `theorem_names` the
   theorem, `permitted_axioms` the axioms you accept. With both exports given, the comparator judges them as they are
@@ -312,26 +381,25 @@ Each `comparator.json` lists them (`external_kernels`), and `verify-source.sh` p
 directory, where they are, first on `PATH`. The comparator accepts only if Lean's kernel and every listed kernel
 accept.
 
-The functions' checks list all three. admin's and admin2's list con-leche and con-ron only. The nanoda Lean 4.35
-ships (nanoda_lib 0.4.19) stops with a stack overflow on these exports, without a verdict: a crash, not a rejection.
-nanoda_lib fixed this in 0.4.25 ([PR #58](https://github.com/ammkrn/nanoda_lib/pull/58), commit `6239144`; see also
+The functions' checks list all three; the programs' (`admin`, `admin2`) list con-leche and
+con-ron only. The nanoda Lean 4.35 ships (nanoda_lib 0.4.19) stops with a stack overflow on admin's and admin2's
+exports, without a verdict (a crash, not a rejection). nanoda_lib fixed the stack overflow in 0.4.25
+([PR #58](https://github.com/ammkrn/nanoda_lib/pull/58), commit `6239144`; see also
 issue #55), a version Lean's toolchain does not ship yet. To run a newer nanoda:
 
 1. build `nanoda_bin` from [nanoda_lib](https://github.com/ammkrn/nanoda_lib), 0.4.25 or later (`cargo build
    --release`, which puts it in `target/release/`);
 2. set `NANODA_BIN` to it. `verify-source.sh` then runs it as a further kernel, for every theorem.
 
-In our runs, nanoda_lib 0.4.30 (commit `d0a02cc`) accepts admin's and admin2's proofs this way, beside the other
-kernels. Each check then takes about an hour, at the same peak memory.
-
-`lake comparator --paranoid` would add every checker Lean ships, `lean4lean` among them. The 4.35 `lean4lean` cannot
-read exports made with Lean 4.34, whatever the proof: it stops at an unknown constant, `Decidable.intro`, which 4.35
-introduced.
+`lake comparator --paranoid` would add every checker Lean ships: also `leanchecker-paranoid` (Lean's kernel with
+further checks; it accepts `memcmp-gcc-os`'s proof) and `lean4lean`. The 4.35 `lean4lean` rejects these exports
+without judging the proof: it stops at the model's first character literal with an unknown constant, `Char.ofNat`
+(``at ZellicX86.rseqUpdate: (kernel) unknown constant 'Char.ofNat'``).
 
 ## How the proofs were made, and why you can check them without that
 
 The proofs were produced by our own proof automation for machine code (symbolic execution, decision procedures and
-generated lemmas), which is not part of this release. You do not need it to check them. Lean's kernel checks proof
+generated lemmas), which is not part of this repository. You do not need it to check them. Lean's kernel checks proof
 terms, not the programs that found them, and each export holds the complete proof term of its theorem: every
 definition and lemma it uses, each with its own proof. `verify-source.sh` has the kernel check all of it against the
 statement in this repository. What you rely on is therefore what is here, the model, the statements and the loader,
@@ -339,7 +407,7 @@ together with Lean's kernel.
 
 Most of the programs' proofs are not specific to them: the proofs of glibc's functions and startup are written once
 for the library, not for these programs, and the files that depend on a binary's layout are
-generated from the binary. What is written by hand for each program is 647 lines of Lean for admin and 739 for
+generated from the binary. What is written by hand for each program is 645 lines of Lean for admin and 739 for
 admin2: code lines, comments left out, of the program's own proof files and its statement, and its entry in a shared
 table of `main`'s stack use. Not counted: the generated files, the library's proofs and the proof automation.
 
@@ -348,13 +416,14 @@ table of `main`'s stack use. Not counted: the generated files, the library's pro
 - `ZellicX86/Spec/` (the model and the vocabulary) and `ZellicX86/Load/` (`#file_image`): read them to know what the
   theorems mean. They import Lean's core only.
 - The statement files named above, and the definitions they use.
-- Lean's kernel (4.35's, through `lake comparator`), the Lean 4.34 elaborator that builds the statements, the
-  exporter `lean4export` that exports the challenge's statement from them (the solution's export is untrusted input),
+- Lean 4.35: its kernel (through `lake comparator`), its elaborator that builds the statements, and its exporter
+  `leanexport` that exports the challenge's statement from them (the solution's export is untrusted input),
   and `lake comparator`'s comparison of the two exports.
-- The code: the functions' bytes are written in the statements (`Examples/*/Code.lean`), and the
-  programs' binaries are fixed by their SHA-256 in the statements (`#file_image`). Which compiler or
-  linker produced them does not matter to the theorems; `Examples/*/build.sh` and
-  `clients/build.sh` record how they were built and check the recorded bytes against a rebuild.
+- The code: `memcmp`'s bytes are written in its statement (`Examples/Memcmp/Code.lean`), and the
+  binaries (`libc.a`, the fixed `memrchr` objects, the programs) are fixed by their SHA-256 in the statements (`#file_image`). Which compiler or
+  linker produced them does not matter to the theorems; `Examples/Memcmp/build.sh`,
+  `fixed/build.sh` and `clients/build.sh` record how they were built and check
+  the recorded bytes against a rebuild.
 - The hypotheses: what a theorem assumes of the processor, the launch and the run (above) is for the reader to check
   of the system they care about.
 
@@ -362,17 +431,19 @@ table of `main`'s stack use. Not counted: the generated files, the library's pro
 
 - `ZellicX86/Spec/`, `ZellicX86/Load/`: the model, the vocabulary, the loader; `MODEL-LIMITATIONS.md`: what the model
   covers and what it does not.
-- `Examples/Memcmp/`: each function's statement (`Statement.lean`), its
-  functional specification (`Spec.lean`) and its bytes (`Code.lean`).
-- `glibc-2.43-ubuntu-26.04-amd64/`: the programs' statements (`Glibc243UbuntuClients/`), the glibc definitions they use
-  (`Glibc243Ubuntu/`: the environment assumption `Heap.MemGranted` and glibc's tunables, whose names the launch
-  hypotheses use), and the binaries (`clients/`).
+- `Examples/Memcmp/`: `memcmp`'s statement (`Statement.lean`), its functional specification (`Spec.lean`) and its
+  bytes (`Code.lean`).
+- `glibc-2.43-ubuntu-26.04-amd64/`: the statements about glibc's code (`Glibc243Ubuntu/MemrchrStatement.lean`: the seven
+  `memrchr` statements; `memrchr`'s contract is the vocabulary's, `ZellicX86/Spec/Lib/C/String.lean`) and the programs' statements (`Glibc243UbuntuClients/`), the glibc definitions they use
+  (`Glibc243Ubuntu/`; the environment assumption `Heap.MemGranted` and glibc's tunables, whose names the launch
+  hypotheses use), and the binaries (Ubuntu's static glibc `libc.a`, downloaded separately; the
+  fixed `memrchr` objects in `fixed/`, with their patches and `build.sh`) and the programs, `clients/`, with their C sources.
 - `ReleaseChallenges/`: each exported theorem stated by `sorry`, the challenges `checks/ID/verify-source.sh` builds.
 - `checks/ID/`: each theorem's checker configuration and script; `exports/SHA256SUMS`: the proof exports' checksums (the
   exports themselves are downloaded into `exports/`).
+- `CHANGES.md`: what each release changed.
 - `THIRD-PARTY-NOTICES.md` and `LICENSES/`: the material from glibc and the Linux kernel that this repository and the
-  proof exports contain (the programs' binaries, the vDSO's tables), its licenses and
-  where its source is.
+  proof exports contain (the binaries, the functions' bytes, the vDSO's tables), its licenses and where its source is.
 
 ## Who wrote this
 

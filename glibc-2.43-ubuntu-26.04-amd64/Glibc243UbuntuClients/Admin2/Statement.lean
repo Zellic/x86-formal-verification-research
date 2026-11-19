@@ -131,7 +131,8 @@ abbrev startStack : Nat := 0x4000
 /-- **`admin2` end to end, for the demonstration**: every process started from `admin2` (`Launch.Of`) on a processor a
 real machine can be (`Profile.Consistent`), on a kernel whose stack guard gap and vDSO image are of ordinary size
 (`LinuxBoot.Modest`), with room on its stack for the startup (`StackRoom`: `startStack` and `_start`'s 32 bytes), the
-demonstration's launch (`DemoArgs`: not secure, no tunables, no `LD_LIBRARY_PATH`) on the development VM's virtual CPU
+demonstration's launch (`DemoArgs`: not secure, no tunables, no `LD_LIBRARY_PATH`, the soft `RLIMIT_AS` and
+`RLIMIT_DATA` unlimited) on the development VM's virtual CPU
 (`ThisProcessor`) and kernel's vDSO (`ThisVdso`), on every run the demonstration admits (`DemoRuns`: undisturbed,
 `/proc/self/exe` procfs's link, the kernel never refusing memory for want of it):
 - *safety*: at every point, what it has read and written is as `SoFar` says, and if it has ended, it ended

@@ -255,16 +255,35 @@ inductive Request
   /-- Whether a system call that changes the layout over `pages` pages fails for a reason the
   model does not track, and how: `none`, it goes on; `some (e, k)`, it fails with error `e` after
   its change was made to the first `k` pages. Such failures are always possible: lack of memory
-  and its accounting (`ENOMEM`), `vm.max_map_count`, limits another process may lower at any time
-  (`RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_MEMLOCK` by `prlimit(2)`), `vm.mmap_min_addr` (`EPERM`),
+  and its accounting (`ENOMEM`; for `MAP_HUGETLB`, also of the pool of huge pages, `vm.nr_hugepages`, and the
+  kernel's hugetlbfs file, `ENOSPC`, `ENOENT`), `vm.max_map_count`, the locked-memory limit (`RLIMIT_MEMLOCK`; the
+  address-space and data limits are checked from the state, `mayExpandVm`), `vm.mmap_min_addr` (`EPERM`),
   and the security module's policy (`EACCES`, `EPERM`). -/
   | memFail (pages : Nat)
   /-- Whether the kernel refuses to grow a stack for a reason the model does not track
-  (`mm/vma.c` `acct_stack_growth`, `expand_downwards`; `true` to refuse): the address space limit
-  (`RLIMIT_AS` against the pages of every VMA), the locked-memory limit of a stack that is locked
+  (`mm/vma.c` `acct_stack_growth`, `expand_downwards`; `true` to refuse; the address space limit, `RLIMIT_AS`, is
+  checked from the state, `growStack`): the locked-memory limit of a stack that is locked
   (`RLIMIT_MEMLOCK`), the overcommit policy (`security_vm_enough_memory_mm`), `vm.mmap_min_addr`,
-  which another agent may change at any time, and memory for the kernel's own structures. -/
-  | growFail
+  which another agent may change at any time, and memory for the kernel's own structures. `page` is the number of the
+  page the stack would grow down to (the new start of its VMA, `expand_downwards`'s `address`): the checks are about
+  the growth to it (`acct_stack_growth`'s size and the pages it adds), so an assumption about the environment can be
+  scoped to growths within a range (`StackGrowsTo`). -/
+  | growFail (page : Nat)
+  /-- Whether the kernel fails to allocate the huge page at the first fault on its page number `page` (`true` to fail):
+  `mm/hugetlb.c` `hugetlb_no_page` allocates it by `alloc_hugetlb_folio`, which fails when the hugetlb cgroup's
+  charge is refused or the pool (`vm.nr_hugepages`, the reservation) has no page for it (`-ENOSPC`); `vmf_error` turns
+  that into `VM_FAULT_SIGBUS` (`include/linux/mm.h`). The pool and the controller are not modelled. A failure with
+  `-ENOMEM` (`vma_needs_reservation`, the memory cgroup's charge; `mm/hugetlb.c` 2977–2979, 3094–3097) gives
+  `VM_FAULT_OOM` and, at a fault of the process's own access, a return to user mode that runs the instruction again
+  (`pagefault_out_of_memory`): a retried fault, eventually granted or the process killed (an outside `SIGKILL`,
+  excluded by `Undisturbed`); not `SIGBUS`. The grant (`false`) covers it (`hugeFault`). `page` is the
+  number of the faulting 4 KiB page, so that an assumption about the environment can be scoped to faults on some pages
+  (`HugeFaultsGranted`). -/
+  | hugeFail (page : Nat)
+  /-- Whether the kernel lets a mapping past `RLIMIT_DATA` be made (`true`) where that limit alone refuses it
+  (`may_expand_vm`, `mm/mmap.c`): it then only warns where `ignore_rlimit_data` is set, a boot option that root may
+  also change while the process runs (`core_param`, mode 0644). `false`: the kernel enforces the limit. -/
+  | dataLimitIgnored
   /-- The time-stamp counter as `RDTSC` reads it (SDM Vol. 3B, 20.17 "Time-Stamp Counter"): a
   value of the CPU the thread runs on, which software with privilege (the kernel, a hypervisor)
   may write and which need not agree between CPUs, so nothing about it is built in: monotonicity
@@ -384,7 +403,9 @@ def Request.Answer : Request → Type
   | .fileAttrs _ => FileAttrs
   | .place _ => BitVec 64
   | .memFail pages => Option (Errno × Fin (pages + 1))
-  | .growFail => Bool
+  | .growFail _ => Bool
+  | .hugeFail _ => Bool
+  | .dataLimitIgnored => Bool
   | .tsc => BitVec 64
   | .xinuse required => { v : BitVec 64 // required &&& v = required }
   | .randomCount n => Except Errno (Fin (n + 1))

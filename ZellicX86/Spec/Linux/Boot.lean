@@ -14,7 +14,8 @@ environment, as requests, and `execve` takes the values it reads of them as its 
 
 Sources: Linux v6.18 `mm/mmap.c`, `arch/x86/kernel/cpu/bus_lock.c`, `arch/x86/entry/vsyscall/vsyscall_64.c`,
 `arch/x86/Kconfig`, `arch/x86/kernel/signal.c`, `arch/x86/kernel/fpu/xstate.h`,
-`arch/x86/entry/vdso/vma.c`, `lib/vdso/datastore.c`.
+`arch/x86/entry/vdso/vma.c`, `lib/vdso/datastore.c`, `mm/madvise.c`,
+`mm/hugetlb.c`, `arch/x86/mm/hugetlbpage.c`.
 -/
 namespace ZellicX86
 
@@ -106,5 +107,26 @@ structure LinuxBoot where
   without randomization, `brk` then accepts breaks down to the end of the data segment
   (`mm/mmap.c` `brk`, `min_brk`). -/
   compatBrk : Bool
+  /-- The kernel is built with transparent huge pages (`CONFIG_TRANSPARENT_HUGEPAGE`, `mm/Kconfig`; off in mainline's
+  default configuration, on in the common distributions' kernels): `madvise` then knows `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE`, which on
+  x86-64 only change VMA flags (`mm/khugepaged.c` `hugepage_madvise`), and `MADV_COLLAPSE`; without it, all three
+  are `EINVAL` (`mm/madvise.c` `madvise_behavior_valid`; `sysMadvise`). Whether the kernel backs memory with huge
+  pages changes no byte a process reads, so the model has nothing else of it. -/
+  thp : Bool := false
+  /-- The sizes of huge pages the kernel has (`struct hstate`, `mm/hugetlb.c`), each as `s` for `2 ^ s` bytes, the
+  default first (`default_hugepagesz=`, else `HPAGE_SIZE`, 2 MiB on x86-64: `mm/hugetlb.c` `hugetlb_init`): what a
+`MAP_HUGETLB` mapping may ask for (`sysMmap`).
+  None without `CONFIG_HUGETLBFS`; on x86-64 with it 21 (2 MiB, `HPAGE_SHIFT`), and 30 (1 GiB) where the processor has
+  `X86_FEATURE_GBPAGES` and the kernel `CONFIG_CONTIG_ALLOC` (`arch/x86/mm/hugetlbpage.c` `gigantic_pages_init`) or
+  the command line asks for it (`hugepagesz=1G`). Fixed from boot. How many pages of each size are free is not: an
+  administrator changes the pool at run time (`vm.nr_hugepages`), so the model leaves it to the environment
+  (`Request.memFail`). -/
+  hugeSizes : List Nat := [21]
+  /-- The kernel is built with names for anonymous memory (`CONFIG_ANON_VMA_NAME`, `mm/Kconfig`; off in mainline's
+  default configuration): `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, …)` then names (or unnames) the VMAs of anonymous
+  memory in a range, which shows only in `/proc/PID/maps` and keeps VMAs of different names apart; without it, every
+  `PR_SET_VMA` call is `EINVAL` (`include/linux/mm.h` `set_anon_vma_name`; `sysPrctl`). A name changes no byte a process
+  reads, and `/proc`'s contents are the environment's answers, so the model keeps no name. -/
+  anonVmaName : Bool := false
 
 end ZellicX86

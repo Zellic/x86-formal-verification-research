@@ -53,7 +53,8 @@ The carve-outs (the hypotheses that restrict the launches, processors, kernels a
 theorem with them is a *demonstration*), each a named definition, here or (those admin2's statement shares) in
 `Program/Demo.lean`:
 - the launch (`DemoArgs`): not secure (`AT_SECURE` 0), no tunables in the environment (neither `GLIBC_TUNABLES` nor any
-  of the tunables' aliases: `NoTunables`), so every tunable keeps its default, and no `LD_LIBRARY_PATH`;
+  of the tunables' aliases: `NoTunables`), so every tunable keeps its default, no `LD_LIBRARY_PATH`, and the soft
+  `RLIMIT_AS` and `RLIMIT_DATA` unlimited;
 - the launch's stack (`StackRoom`: room for the startup, `startStack` and `_start`'s 32 bytes) and memory limits
   (`DemoLimits`): `RLIMIT_DATA` and `RLIMIT_AS` at least the stated bounds; `DemoLimits` explains how this restriction
   interacts with the memory-grant assumption;
@@ -144,7 +145,7 @@ export Glibc243Ubuntu.Program.Demo (cpuidRecord SameAnswer subleaflessLeaves Thi
 
 /-- The bytes of stack below its entry `rsp` that glibc's startup may write, for the launches the theorem covers: its own
 frames, with a copy of `LD_LIBRARY_PATH`'s value of at most `libPathMax` bytes on it (`_dl_init_paths`' `strdupa`,
-`elf/dl-load.c`, the startup's only use of stack that grows with its input), and the stack `main` (`0x420` bytes)
+`elf/dl-load.c`, the startup's only use of stack that grows with its input), and the stack `main` (`0x520` bytes)
 and the exit use below `main`'s entry, which lies in the startup's
 frame. Measured on this program: the startup writes 4,616 bytes below the initial `rsp` with no `LD_LIBRARY_PATH` and
 8,840 with one of 8,192 bytes, and calls `main` 280 bytes below it. The declared budget is 16 KiB. -/
@@ -168,8 +169,9 @@ itself kills it (`SIGSEGV`).
 The model's `execve` checks `RLIMIT_AS` and `RLIMIT_DATA` as the kernel does (`ZellicX86/Spec/Linux/Exec.lean`), so a launch
 whose limits are too small for the image has no `ExecStart` and is not among `holds`' runs anyway. Its `brk` and `mmap` leave a refusal
 for them to `Request.memFail` (with the kernel's other reasons), which `DemoEnv`'s `Heap.MemGranted` rules out whatever
-the reason. Thus `DemoLimits` is an explicit restriction on the launches covered by the demonstration; the syscall
-models leave refusals for these limits to the environment request. -/
+the reason. With `DemoArgs` asking both soft limits unlimited (`RLIM_INFINITY`), `DemoLimits` adds nothing for a real
+launch: it holds wherever `0x800000 + pageUp (8 + a.strings.length) ≤ 2 ^ 64 - 1`. It is kept from release 1, whose
+`DemoArgs` did not fix the limits. -/
 def DemoLimits (a : ExecArgs) : Prop :=
   0x400000 ≤ (a.signal.rlimits RLIMIT_DATA).cur.toNat ∧
     0x800000 + pageUp (8 + a.strings.length) ≤ (a.signal.rlimits RLIMIT_AS).cur.toNat
@@ -183,9 +185,8 @@ def StartEnv (o : Oracle) : Prop :=
 (`StartEnv`), in which the kernel never refuses memory for want of it (`Heap.MemGranted`: no
 `Request.memFail`). Placement checks can still fail independently of this hypothesis (`sysBrk`, `Request.place`),
 so `malloc` may return null in such a run. A refusal for the process's limits, set by it or inherited from the one
-that started it, is one of those it rules out: the `brk` and `mmap` models leave refusals for them to this request. So
-it also leaves out every launch whose `RLIMIT_DATA` or `RLIMIT_AS` is too small for the startup's and `main`'s memory
-(with a data limit of 64 KiB the real startup ends with status 127), whatever `DemoLimits` says. -/
+that started it, is one of those it rules out: the `brk` and `mmap` models leave refusals for them to this request. The
+launch's own soft `RLIMIT_DATA` and `RLIMIT_AS` are unlimited (`DemoArgs`). -/
 def DemoEnv (o : Oracle) : Prop := StartEnv o ∧ Heap.MemGranted o
 
 /-! ## The theorem -/
@@ -193,7 +194,8 @@ def DemoEnv (o : Oracle) : Prop := StartEnv o ∧ Heap.MemGranted o
 /-- **`admin` end to end, under the demonstration's carve-outs**: every process started from `admin` (`Launch.Of`) on a processor a
 real machine can be (`Profile.Consistent`), on a kernel whose stack guard gap and vDSO image are of ordinary size
 (`LinuxBoot.Modest`), with room on its stack for the startup (`StackRoom`), the demonstration's launch
-(`DemoArgs`: not secure, no tunables, no `LD_LIBRARY_PATH`) with its memory limits at least the runs' needs
+(`DemoArgs`: not secure, no tunables, no `LD_LIBRARY_PATH`, the soft `RLIMIT_AS` and `RLIMIT_DATA` unlimited) with its
+memory limits at least the runs' needs
 (`DemoLimits`) on the development VM's virtual CPU (`ThisProcessor`) and kernel's vDSO (`ThisVdso`), on every run the
 demonstration admits (`DemoEnv`):
 - *safety*: at every point, what it has read and written is as `SoFar` says (standard output a first part of

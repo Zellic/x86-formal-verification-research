@@ -1,0 +1,35 @@
+--- a/sysdeps/x86_64/multiarch/memrchr-avx2.S
++++ b/sysdeps/x86_64/multiarch/memrchr-avx2.S
+@@ -185,6 +185,9 @@
+ 	subq	$(VEC_SIZE * 3), %rax
+ 	COND_VZEROUPPER
+ 	subq	%rcx, %rax
++	/* If the vector holds no CHAR and starts at address 0, the
++	   subtraction borrows: the result lies below s, so null.  */
++	jb	L(zero_2)
+ 	cmpq	%rax, %rdi
+ 	ja	L(zero_2)
+ 	ret
+@@ -200,6 +203,9 @@
+ 	subq	$(VEC_SIZE * 2), %rax
+ 	COND_VZEROUPPER
+ 	subq	%rcx, %rax
++	/* If the vector holds no CHAR and starts at address 0, the
++	   subtraction borrows: the result lies below s, so null.  */
++	jb	L(zero_2)
+ 	cmpq	%rax, %rdi
+ 	ja	L(zero_2)
+ 	ret
+@@ -295,8 +301,12 @@
+ 	subq	$(VEC_SIZE * 2), %rax
+ 	COND_VZEROUPPER
+ 	subq	%rcx, %rax
++	/* If the vector holds no CHAR and starts at address 0, the
++	   subtraction borrows: the result lies below s, so null.  */
++	jb	L(zero_3)
+ 	cmpq	%rax, %rdi
+ 	jbe	L(ret0)
++L(zero_3):
+ 	xorl	%eax, %eax
+ L(ret0):
+ 	ret

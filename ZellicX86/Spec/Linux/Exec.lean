@@ -466,7 +466,7 @@ page number): the model does not say which of them the kernel made one VMA. -/
 def regionsMemory (rs : List Region) (files : Files) (growsDown : List PageNum) : Memory :=
   let at? (p : Nat) := rs.reverse.find? (·.has p)
   { map := fun p => (at? p.toNat).map fun r =>
-      ⟨r.prot, p.toNat, 0, r.special, r.origin (p.toNat - r.first), p.toNat, r.maxProt, r.growsDown⟩
+      ⟨r.prot, p.toNat, 0, r.special, r.origin (p.toNat - r.first), p.toNat, r.maxProt, r.growsDown, none⟩
     backings := fun i => match at? i with
       | some r => r.backing (i - r.first)
       | none => .priv zeroFrame
@@ -572,6 +572,10 @@ def brkBase (phs : List Phdr) : Nat :=
   pageUp (phs.foldl (fun acc ph => if ph.type = PT_LOAD then max acc (ph.vaddr + ph.memsz)
     else acc) 0)
 
+/-- The highest loadable segment's start, `mm->start_data` (`load_elf_binary`). -/
+def dataStart (phs : List Phdr) : Nat :=
+  phs.foldl (fun acc ph => if ph.type = PT_LOAD then max acc ph.vaddr else acc) 0
+
 /-- The end of the loadable segments' file bytes, `mm->end_data` (`load_elf_binary`). -/
 def endData (phs : List Phdr) : Nat :=
   phs.foldl (fun acc ph => if ph.type = PT_LOAD then max acc (ph.vaddr + ph.filesz) else acc) 0
@@ -584,18 +588,6 @@ def brkMin (lb : LinuxBoot) (phs : List Phdr) (a : ExecArgs) (c : ExecChoice) : 
   if lb.compatBrk ∧ c.brk = brkBase phs ∧ !a.brkRandomized then endData phs else c.brk
 
 /-! ## Memory limits -/
-
-/-- A resource limit's soft value in pages, as `may_expand_vm` compares with it (`rlimit(r) >> PAGE_SHIFT`). -/
-def Rlimit.pages (r : Rlimit) : Nat := r.cur.toNat / 4096
-
-/-- Whether `may_expand_vm` (`mm/mmap.c`) lets an area of `n` pages be added to `total` pages of mappings and, for a
-private writable area (`data`, `is_data_mapping`: `VM_WRITE` without `VM_SHARED` or `VM_STACK`), to `dataVm` pages of
-such areas, under the limits `as` (`RLIMIT_AS`) and `dat` (`RLIMIT_DATA`): the first not above `as`, the second
-not above `dat` unless `dat` is 0 and the area fits the hard limit (a workaround the kernel keeps for Valgrind) or
-the kernel ignores `RLIMIT_DATA` (`KernelConfig.ignoreRlimitData`). -/
-def mayExpand (as dat : Rlimit) (ignoreData : Bool) (total dataVm n : Nat) (data : Bool) : Bool :=
-  total + n ≤ as.pages &&
-    (!data || dataVm + n ≤ dat.pages || (dat.cur = 0 && dataVm + n ≤ dat.max.toNat / 4096) || ignoreData)
 
 /-- The pages of the half-open page range `[lo, hi)` within the disjoint ranges `iv` (each with whether it is data),
 and those of them that are data. -/
@@ -796,7 +788,10 @@ def execve (prof : Profile) (files : Files) (exe : FileId) (a : ExecArgs) (k : K
       let s : State :=
         { proc := { mm := { mem
                             brkMin := BitVec.ofNat 64 (brkMin prof.linux phs a c)
-                            brk := BitVec.ofNat 64 c.brk }
+                            brk := BitVec.ofNat 64 c.brk
+                            startBrk := BitVec.ofNat 64 c.brk
+                            startData := BitVec.ofNat 64 (dataStart phs)
+                            endData := BitVec.ofNat 64 (endData phs) }
                     files := fun n => match a.files n with
                       | some ⟨f, false⟩ => some ⟨f, false⟩
                       | _ => none

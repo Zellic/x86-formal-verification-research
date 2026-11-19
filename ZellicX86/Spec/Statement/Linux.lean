@@ -198,10 +198,15 @@ structure KeepsProc (moved : List Nat) (s₀ s : State) : Prop where
   sighand : s.proc.sighand = s₀.proc.sighand
   /-- The signals pending for the process, and the resource limits. -/
   signal : s.proc.signal = s₀.proc.signal
+  /-- The initial break and the data segment's bounds, which `brk`'s `RLIMIT_DATA` check reads (`Mm.dataUse`): only
+  `execve` sets them (and `prctl(PR_SET_MM)`, not modelled). -/
+  startBrk : s.proc.mm.startBrk = s₀.proc.mm.startBrk
+  startData : s.proc.mm.startData = s₀.proc.mm.startData
+  endData : s.proc.mm.endData = s₀.proc.mm.endData
 
 /-! ## The memory layout -/
 
-/-- The layout of `s` is one a process on a processor with features `feat` can have, in six respects the model's types
+/-- The layout of `s` is one a process on a processor with features `feat` can have, in eight respects the model's types
 do not enforce:
 the initial stack's first page as `execve` mapped it (`Memory.growsDown`) is mapped, no page maps a backing
 from `Memory.fresh` on, the lowest break `brk` accepts (`Mm.brkMin`) is above 0, the program break is at or
@@ -238,14 +243,76 @@ it (`mm/mmap.c` `brk`, `check_brk_limits`), the stack's growth looks for the sta
 and `mprotect` and `munmap` map nothing new. The page of the legacy vsyscall area (`vsyscallPage`, `0xffffffffff600000`)
 is above it: in `vsyscall=emulate` mode the model maps it, as a special mapping, and the kernel serves it from its
 gate area (`arch/x86/entry/vsyscall/vsyscall_64.c`), not a VMA of the process. A function that maps memory relies on
-it where a range's end must be within the user address space (a zero-length range at a mapping's end, `access_ok`). -/
-def LayoutOk (feat : Features) (s : State) : Prop :=
-  (∀ g ∈ s.proc.mm.mem.growsDown, s.proc.mm.mem.map g ≠ none) ∧
-  (∀ p m, s.proc.mm.mem.map p = some m → m.backing < s.proc.mm.mem.fresh) ∧
-  0 < s.proc.mm.brkMin.toNat ∧ s.proc.mm.brkMin.toNat ≤ s.proc.mm.brk.toNat ∧
-  (∀ p m, s.proc.mm.mem.map p = some m → m.maxProt.read = true) ∧
-  (∀ p m, s.proc.mm.mem.map p = some m →
-    (p.toNat + 1) * 4096 ≤ taskSize feat ∨ (p = vsyscallPage ∧ m.special = true))
+it where a range's end must be within the user address space (a zero-length range at a mapping's end, `access_ok`).
+The seventh: the program break's page ends at most `2 ^ 30` bytes above `TASK_SIZE`. `execve` puts the break at the
+page after the highest segment (which ends below `TASK_SIZE`), with randomization one page more plus fewer than `2 ^ 30`
+bytes in whole pages (`fs/binfmt_elf.c` `load_elf_binary`, `arch/x86/kernel/process.c` `arch_randomize_brk`;
+`ExecChoice.Valid`); `brk` moves the break within its page without other checks, grows it only by mapping pages below
+`TASK_SIZE` (`check_brk_limits`) and shrinks it (`mm/mmap.c` `brk`; Linux v6.18); `prctl(PR_SET_MM)`, which the model
+does not have, keeps it below `TASK_SIZE` (`kernel/sys.c` `validate_prctl_map_addr`). A function that grows the heap
+relies on it where the heap's end must fit (`sysmalloc`'s first allocation, whose heap starts at the break).
+The eighth: no page's area (`Mapping.area`, the VMA it belongs to) is from `Memory.fresh` on. `execve` starts `fresh` past
+every area it makes, and every change of the layout that makes an area takes it from `fresh` and moves `fresh` past it
+(`Memory.fresh`); a growth of the stack keeps the stack's area. A proof that relates two runs whose new mappings take
+different areas (the stack-growth lift, notebook note 390 §18) relies on it: a new mapping's area is no old page's. -/
+structure LayoutOk (feat : Features) (s : State) : Prop where
+  /-- The initial stack's first page as `execve` mapped it is mapped. -/
+  growsDown : ∀ g ∈ s.proc.mm.mem.growsDown, s.proc.mm.mem.map g ≠ none
+  /-- No page maps a backing from `fresh` on. -/
+  below : ∀ p m, s.proc.mm.mem.map p = some m → m.backing < s.proc.mm.mem.fresh
+  /-- The lowest break is above 0. -/
+  brkMinPos : 0 < s.proc.mm.brkMin.toNat
+  /-- The program break is at or above the lowest break. -/
+  brkMinLe : s.proc.mm.brkMin.toNat ≤ s.proc.mm.brk.toNat
+  /-- Every mapped page's maximum protection allows reading. -/
+  maxRead : ∀ p m, s.proc.mm.mem.map p = some m → m.maxProt.read = true
+  /-- Every mapped page lies below the end of the user address space, but the vsyscall page. -/
+  user : ∀ p m, s.proc.mm.mem.map p = some m →
+    (p.toNat + 1) * 4096 ≤ taskSize feat ∨ (p = vsyscallPage ∧ m.special = true)
+  /-- The program break's page ends at most `2 ^ 30` bytes above `TASK_SIZE`. -/
+  brkPage : pageUp s.proc.mm.brk.toNat ≤ taskSize feat + 2 ^ 30
+  /-- No page's area is from `fresh` on. -/
+  areaBelow : ∀ p m, s.proc.mm.mem.map p = some m → m.area < s.proc.mm.mem.fresh
+
+/-- A process's signal state with `RLIMIT_AS` and `RLIMIT_DATA` at `RLIM_INFINITY` (`LimitsUnlimited`; temporary as
+it, Malte, 2026-11-06). -/
+def RlimitsUnlimited (σ : ProcSignal) : Prop :=
+  (σ.rlimits RLIMIT_AS).cur = RLIM_INFINITY ∧ (σ.rlimits RLIMIT_DATA).cur = RLIM_INFINITY
+
+/-- The process's address-space and data limits are unlimited in `s` (`RLIMIT_AS` and `RLIMIT_DATA` at
+`RLIM_INFINITY`, the usual default): `brk`'s `check_data_rlimit` lets every break through (`Mm.dataFits`), and
+`may_expand_vm` refuses no `brk`, `mmap`, `mremap` or stack growth where the mapped pages lie in user space
+(`LayoutOk`, which bounds `Memory.totalVm` and `Memory.dataVm` by its pages: `mayExpand_unlimited`).
+An assumption a contract's environment may make about its entry state (`Contract.env`); with `Undisturbed`, which keeps
+other agents from changing the limits, it holds throughout a run that sets no limit itself.
+Temporary (Malte, 2026-11-06): a bounded form, the limits at least what the run needs, replaces it; it implies every such
+bound, so the replacement only weakens what statements assume. -/
+def LimitsUnlimited (s : State) : Prop := RlimitsUnlimited s.proc.signal
+
+/-- **P** (Malte, 2026-11-06: the limits at least what the run needs; the form is the session's) The process's
+address-space and data limits leave room in `s` for `g` more bytes: its mappings (`Memory.totalVm` pages, against
+`RLIMIT_AS`), its private writable mappings (`Memory.dataVm` pages, against `RLIMIT_DATA`) and the bytes its break
+counts against `RLIMIT_DATA` (`Mm.dataUse`, which the kernel does not count where that limit is `RLIM_INFINITY`) may
+each grow by `g` bytes and stay within the soft limit. So a `brk` that moves the break up by at most `g` less a page
+passes `check_data_rlimit` and `may_expand_vm` (`Mm.dataFits`, `mayExpandVm`). An assumption a contract's environment
+may make about its entry state (`Contract.env`), with `g` at least what its run maps; with `Undisturbed`, which keeps
+other agents from changing the limits, the room left shrinks only by what the run maps. -/
+def LimitsRoom (s : State) (g : Nat) : Prop :=
+  4096 * s.proc.mm.mem.totalVm + g ≤ (s.proc.signal.rlimits RLIMIT_AS).cur.toNat ∧
+  4096 * s.proc.mm.mem.dataVm + g ≤ (s.proc.signal.rlimits RLIMIT_DATA).cur.toNat ∧
+  ((s.proc.signal.rlimits RLIMIT_DATA).cur = RLIM_INFINITY ∨
+    s.proc.mm.dataUse s.proc.mm.brk + g ≤ (s.proc.signal.rlimits RLIMIT_DATA).cur.toNat)
+
+/-- **P** (Malte, 2026-11-06, note 380 §13) From `s₀` to `s` the process's use of what the address-space and data limits
+count grew by at most `u` bytes on each count (`LimitsRoom`'s): its mappings (`Memory.totalVm` pages), its private writable
+mappings (`Memory.dataVm` pages) and the bytes its break counts against `RLIMIT_DATA` (`Mm.dataUse`), with the initial
+break and the data segment kept. What a function that maps memory promises about how much (`u` from its entry). -/
+def UsesAtMost (s₀ s : State) (u : Nat) : Prop :=
+  4096 * s.proc.mm.mem.totalVm ≤ 4096 * s₀.proc.mm.mem.totalVm + u ∧
+  4096 * s.proc.mm.mem.dataVm ≤ 4096 * s₀.proc.mm.mem.dataVm + u ∧
+  s.proc.mm.dataUse s.proc.mm.brk ≤ s₀.proc.mm.dataUse s₀.proc.mm.brk + u ∧
+  s.proc.mm.startBrk = s₀.proc.mm.startBrk ∧ s.proc.mm.startData = s₀.proc.mm.startData ∧
+  s.proc.mm.endData = s₀.proc.mm.endData
 
 /-- From `s₀` to `s`, what of the address space and the files every function keeps, whether or not it
 may change the memory layout (`KeepsEnv`, `KeepsEnvOut`), is as it was. -/
@@ -363,6 +430,96 @@ byte asked for up to the file's end. An assumption about the system, as `Undistu
 agents: a statement makes it by running over `fun o => Undisturbed o ∧ ReadsWhole o`. -/
 def ReadsWhole (o : Oracle) : Prop :=
   ∀ t file n, o t (.readFail file n) = none
+
+/-- The page after the last page holding a byte of `r` (its pages are those from `pageOf r.base` up to before this). -/
+def Rgn.endPage (r : Rgn) : Nat := (r.base.toNat + r.len + 4095) / 4096
+
+/-- The system refuses no growth of a stack down to a page number from `lo` up to before `hi` for a reason the model does
+not track (`Request.growFail`: the locked-memory limit of a locked stack, `RLIMIT_MEMLOCK`; the overcommit policy;
+`vm.mmap_min_addr`; memory for the kernel's own structures; `growStack`, which checks `RLIMIT_AS` from the state). An
+assumption about the system, as `ReadsWhole`, and only about the growths within a call's frame: a call whose frame
+covers the pages from `lo` to before `hi` runs over `fun o => Undisturbed o ∧ StackGrowsTo lo hi o` (notebook note 382
+§6; Malte, 2026-11-06). Growths to other pages, which a call within its frame never asks for, stay the environment's
+to refuse; a callee's frame lies within its caller's, so its assumption follows from the caller's. -/
+def StackGrowsTo (lo hi : Nat) (o : Oracle) : Prop :=
+  ∀ t p, lo ≤ p → p < hi → o t (.growFail p) = false
+
+/-- **P** (Malte, 2026-11-07: an environment assumption beside `StackGrowsTo`; its reach below `lo` claude2's, notebook
+note 390 §18) The system places no new mapping (`Request.place`: `mmap`, `mremap`) whose pages, or the `gap` pages above
+them, meet the pages from `lo` to before `hi`. The kernel chooses a free range below `mmap_base` and keeps its own guard
+gap only below the stack's present start (`vm_unmapped_area`, `vm_start_gap`, `mm/vma.c`, v6.18). A mapping placed in a
+call's frame below that, or within `gap` pages under the frame's lowest page, would stop the stack's growth into the
+frame (`growStack`: the guard gap below a stack must hold no mapping that does not grow down and allows some access;
+`expand_downwards`, `mm/mmap.c`). An assumption about the system, scoped as `StackGrowsTo`: a call whose frame covers the
+pages from `lo` to before `hi` runs over `PlacesAvoid lo hi prof.linux.stackGuardGap` (`ImplementsCallG`). -/
+def PlacesAvoid (lo hi gap : Nat) (o : Oracle) : Prop :=
+  ∀ t L, (o t (.place L)).toNat / 4096 + L / 4096 + gap ≤ lo ∨ hi ≤ (o t (.place L)).toNat / 4096
+
+/-- The system allocates the huge page at every first fault on a page whose number satisfies `P` (`Request.hugeFail`:
+the hugetlb controller's charge, the pool of huge pages; `hugeFault`, `mm/hugetlb.c` `hugetlb_no_page`): the first
+faults of the `#PF` handler (the process's own accesses) and of the kernel's accesses to user memory (`growFor`).
+`MADV_POPULATE_READ`/`_WRITE`'s allocations are not among them: their failure is `madvise`'s error
+(`Request.memFail`). An assumption about the system, as `StackGrowsTo`, scoped to the pages `P`: a call that may meet
+such faults on its own memory runs over `fun o => Undisturbed o ∧ HugeFaultsGranted P o`. Faults on other pages stay the
+environment's to refuse. The question is asked of the faulting 4 KiB page (`pageOf a`), while the kernel allocates or
+refuses the whole huge page: a `P` that holds of some pages of a huge page and not of others grants the faults at the
+first and leaves those at the others to the environment, so a statement's `P` is best a union of whole huge pages. -/
+def HugeFaultsGranted (P : Nat → Prop) (o : Oracle) : Prop :=
+  ∀ t p, P p → o t (.hugeFail p) = false
+
+/-- The process was killed by the `SIGBUS` the kernel sends when it cannot allocate a huge page at the first fault on
+its page at `a` (`KillCause.hugeFault`), with that page's number satisfying `P`: a refusal of the system's, which a
+statement over `HugeFaultsGranted P` rules out. -/
+def RefusedHugeFault (P : Nat → Prop) : Outcome → Prop
+  | .killed sig (.hugeFault a) => sig = Signal.SIGBUS ∧ P (pageOf a).toNat
+  | _ => False
+
+/-- In `s`, on the machine `prof`, the first `n` bytes of the region `r` (a call's stack frame, from its lowest byte)
+can become stack by the kernel's growth of it, and the rest of `r` starts on a page of its own: the first `n` bytes lie on
+pages no mapping covers; the page after them, `q`, is the first mapped page above `r`'s first byte, of a mapping `m`
+that grows down within the stack's limit (`stackAbove`); and a growth to `r`'s first page passes the kernel's checks
+(`growStack`): no accessible mapping that does not grow down within the guard gap below, the VMA after it within the
+stack's limit under both readings of where it ends, the pages it adds within the address space's limit (`RLIMIT_AS`,
+`asRoom`), `r`'s first byte below `TASK_SIZE`, and the pages it gives allow writing those `n` bytes. A growth to a higher page of `r` passes them too (the gap, the limit and the pages are those of
+the lowest page or fewer). `n = 0` says nothing: the frame is mapped, as on a thread's stack, which does not grow.
+The rest of the frame is the call's to find mapped and writable (`CallOfG`). The system may still refuse the growth
+(`StackGrowsTo`). Notebook note 382 §6 (Malte, 2026-11-06). A fetch from an ungrown page grows the stack as a data access
+does (`lock_mm_and_find_vma`, then the access check `access_error` faults if the stack does not allow it; the model does
+the same), so the stack may allow fetching (notebook note 390 §9). -/
+structure FrameRoom (prof : Profile) (s : State) (r : Rgn) (n : Nat) : Prop where
+  le : n ≤ r.len
+  unmapped : ∀ a, (⟨r.base, n⟩ : Rgn).Mem a → s.proc.mm.mem.map (pageOf a) = none
+  grows : 0 < n → ∃ q m, stackAbove prof.feat s r.base = some (q, m) ∧ r.base.toNat + n = q * 4096 ∧
+    ((s.proc.mm.mem.prevMapped (pageOf r.base).toNat prof.linux.stackGuardGap).any
+      fun mp => !mp.growsDown && mp.accessible) = false ∧
+    q - (pageOf r.base).toNat + s.proc.mm.mem.pagesWhile (·.area == m.area) q (stackLimitPages s + 1) ≤
+      stackLimitPages s ∧
+    q - (pageOf r.base).toNat + s.proc.mm.mem.pagesWhile (fun x =>
+      x.growsDown && x.prot == m.prot && x.pkey == m.pkey && x.maxProt == m.maxProt) q (stackLimitPages s + 1) ≤
+      stackLimitPages s ∧
+    r.base.toNat < taskSize prof.feat ∧
+    Accessible prof.feat (s.withMem (s.proc.mm.mem.growDown (pageOf r.base).toNat (q - (pageOf r.base).toNat) m))
+      .write ⟨r.base, n⟩
+  asRoom : 0 < n → ∀ q m, stackAbove prof.feat s r.base = some (q, m) →
+    s.proc.mm.mem.totalVm + (q - (pageOf r.base).toNat) ≤ (s.proc.signal.rlimits RLIMIT_AS).pages
+
+/-- In `s`, page number `k` lies within a stack's reach: at most the stack's limit (`stackLimitPages`) and a guard gap of
+`gap` pages below the last page `j` of an area (a VMA, `Mapping.area`) that holds a page `i` mapped growing down, every
+page from `i` to `j` mapped in that area. The kernel bounds a stack's size from its VMA's end (`acct_stack_growth`,
+`mm/vma.c`, v6.18: `vm_end - address ≤ RLIMIT_STACK`) and keeps other mappings out of the guard gap below it, so such a
+stack grows over no page outside its reach. -/
+def StackReach (gap : Nat) (s : State) (k : Nat) : Prop :=
+  ∃ i j m, i ≤ j ∧ k ≤ j ∧ j ≤ k + stackLimitPages s + gap ∧ s.proc.mm.mem.mapAt i = some m ∧ m.growsDown = true ∧
+    (∀ x, i ≤ x → x ≤ j → ∃ m', s.proc.mm.mem.mapAt x = some m' ∧ m'.area = m.area) ∧
+    ∀ m', s.proc.mm.mem.mapAt (j + 1) = some m' → m'.area ≠ m.area
+
+/-- In `s`, no page of `r` lies within a stack's reach (`StackReach`, with the guard gap of `gap` pages, a statement's
+`prof.linux.stackGuardGap`): what a contract whose function unmaps `r` assumes of it at the call, so that a call growing
+its stack into its frame never meets that change. Allocators' mappings lie below `mmap_base`, which Linux keeps at least
+the stack's limit and the guard gap below the stack's top (`arch/x86/mm/mmap.c`, v6.18); a statement still says it of
+its regions. **Provisional** (notebook `decisions.md`, P; note 390 §17). -/
+def OffStackReach (gap : Nat) (s : State) (r : Rgn) : Prop :=
+  ∀ k, (pageOf r.base).toNat ≤ k → k < r.endPage → ¬ StackReach gap s k
 
 /-- No `write` of at least one byte takes none without failing (`Request.write`, `Request.writeFault`: the answer
 `WriteResult.wrote 0` only for no bytes). Linux's pipes wait for room and its terminals and regular files take a byte
@@ -497,17 +654,28 @@ nothing into it. -/
 def Event.IsMunmap (ev : Event) (addr len : BitVec 64) : Prop :=
   arg32 ev.nr = 11 ∧ ev.args.take 2 = [addr, len] ∧ ev.fromProc = [] ∧ ev.toProc = []
 
-/-- `ev` is a system call of the memory family an allocator makes to get or give back memory:
+/-- `ev` is a `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, start, len, name)` system call (number 157, `sysPrctl`): the
+option in `rdi`'s low 32 bits (an `int`) is `PR_SET_VMA` and the sub-option in `rsi` is `PR_SET_VMA_ANON_NAME`, with any
+range and name. It names (or, with no name, unnames) the anonymous memory of the range, which changes no byte the
+process reads. The event's `fromProc` (the name's bytes, as the kernel took them) is left open. -/
+def Event.IsVmaName (ev : Event) : Prop :=
+  arg32 ev.nr = 157 ∧ arg32 (ev.args.headD 0) = PR_SET_VMA ∧ (ev.args.getD 1 0).toNat = PR_SET_VMA_ANON_NAME
+
+/-- `ev` is a system call of the memory family an allocator makes to get, give back, advise on or name memory:
 `brk` (number 12, `sysBrk`), a private anonymous `mmap` (number 9, `sysMmap`, with `MAP_ANONYMOUS`
-and the type `MAP_PRIVATE` in its flags, `r10`), `munmap` (11, `sysMunmap`) or `mprotect` (10,
-`sysMprotect`), with any arguments (the number in `rax`'s low 32 bits, as the kernel reads it), and the kernel took nothing from the process's memory and
-delivered nothing into it. What the call did to the layout is the state's business, not the
-event's. -/
+and the type `MAP_PRIVATE` in its flags, `r10`), `munmap` (11, `sysMunmap`), `mprotect` (10,
+`sysMprotect`) or `madvise` (28, `sysMadvise`, with any advice: glibc's `malloc` asks for transparent huge pages,
+other allocators drop pages' contents), with any arguments (the number in `rax`'s low 32 bits, as the kernel reads it),
+the kernel taking nothing from the process's memory; or the naming of anonymous memory (`Event.IsVmaName`, with any
+range and name: glibc names its mappings where `glibc.mem.decorate_maps` is set). The kernel delivers nothing into the
+process's memory. What the call did to the layout and the memory is the state's business, not the event's. -/
 def Event.IsMemCall (ev : Event) : Prop :=
-  ev.fromProc = [] ∧ ev.toProc = [] ∧
-  (arg32 ev.nr = 12 ∨ arg32 ev.nr = 11 ∨ arg32 ev.nr = 10 ∨
-    arg32 ev.nr = 9 ∧ ∃ addr len prot flags fd off, ev.args = [addr, len, prot, flags, fd, off] ∧
-      flags.toNat / 32 % 2 = 1 ∧ flags.toNat % 16 = 2)
+  ev.toProc = [] ∧
+  (ev.fromProc = [] ∧
+    (arg32 ev.nr = 12 ∨ arg32 ev.nr = 11 ∨ arg32 ev.nr = 10 ∨ arg32 ev.nr = 28 ∨
+      arg32 ev.nr = 9 ∧ ∃ addr len prot flags fd off, ev.args = [addr, len, prot, flags, fd, off] ∧
+        flags.toNat / 32 % 2 = 1 ∧ flags.toNat % 16 = 2) ∨
+    ev.IsVmaName)
 
 /-! ## Output and input as byte streams -/
 

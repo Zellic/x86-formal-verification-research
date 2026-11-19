@@ -205,7 +205,7 @@ def sendSelf (prof : Profile) (s : State) (sig : Signal) (code : BitVec 32) (toT
   if sig = SIGKILL then
     if s.proc.signal.unkillable then sysReturnSignals prof s s 0 [] else Pure.pure (.stopped (.killed sig .self))
   else
-  let q : Queued := ⟨SigInfo.ofSender sig code s.thread.tid s.thread.uid, .self⟩
+  let q : Queued := { info := SigInfo.ofSender sig code s.thread.tid s.thread.uid, cause := .self }
   let queued := s.thread.sigmask.mem sig || !sigTaskIgnored s sig false
   let kept : Bool ← if 32 ≤ sig ∧ queued then Req.request (.queued sig) else Pure.pure true
   if kept then sysReturnSignals prof s (sendSignal s q toThread false) 0 []
@@ -271,7 +271,7 @@ def Cpu.fpuClear (c : Cpu) (pkru : BitVec 32) : Cpu :=
   that is readable but not present (the model does not track which are), and then retries only if
   every byte of the area (`user_size` bytes) can be faulted in (`fault_in_readable`): with a byte of the
   area that cannot be read, the restore may fail (`Request.pick`). An instruction that faults
-  otherwise fails. An area where the kernel's reads may grow a stack (`mayGrowFor`) is not modelled;
+  otherwise fails. An area where the kernel's reads may grow a stack or allocate a huge page (`mayGrowFor`) is not modelled;
 - every component the kernel saves that was not loaded is put in its initial configuration, from
   the kernel's initial area: `MXCSR` becomes `1F80H` with SSE among them, and may with AVX (a
   standard-form `XRSTOR` loads it, a compacted one, `XRSTORS`, does not; which the kernel uses is fixed at
@@ -289,7 +289,7 @@ def fpuRestore (prof : Profile) (s : State) (buf : Addr) : Req (XLoad Cpu) := do
     Pure.pure (.ok (s.cpu.fpuClear pk.val))
   else if !accessOk feat buf (size + 4) then Pure.pure .gp else
   if mayGrowFor feat s .read buf (size + 4) then
-    Pure.pure (.notModelled "a signal frame's XSAVE area for which the kernel may grow a stack") else
+    Pure.pure (.notModelled "a signal frame's XSAVE area for which the kernel may grow a stack or allocate a huge page") else
   match rd 464 48 with
   | none => Pure.pure .gp
   | some sw =>
@@ -360,7 +360,7 @@ def sysRtSigreturn (prof : Profile) (s : State) : Req StepResult := do
   let rd (t : State) (o n : Nat) : Option (List Byte) := kernelRead feat t (frame.add o) n
   let ev (ret : BitVec 64) : Event := ⟨s.cpu.gpr.rax, syscallArgs s, ret, [], []⟩
   let bad (t : State) : Req StepResult :=
-    deliverSignals prof none (some (ev 0)) ((t.force ⟨SigInfo.kernel SIGSEGV, .kernel⟩).setRax 0)
+    deliverSignals prof none (some (ev 0)) ((t.force { info := SigInfo.kernel SIGSEGV, cause := .kernel }).setRax 0)
   let stop (what : String) : Req StepResult := Pure.pure (.stopped (.notModelled (.feature what)))
   if s.thread.shstk.isSome then stop "rt_sigreturn with a shadow stack" else
   if !accessOkFixed feat frame rtSigframeSize then bad s else do

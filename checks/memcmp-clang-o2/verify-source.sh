@@ -1,7 +1,7 @@
 #!/bin/bash
 # Checks the proof export of `Memcmp.clangO2_holds` (`solution.ndjson.zst` beside this script) against the statement in
 # the repository STATEMENTS_PROJECT, with Lean's own tools only:
-#   1. Lean 4.34.0 builds the challenge `ReleaseChallenges.memcmp_clang_o2`: the theorem as the repository states
+#   1. Lean 4.35.0 builds the challenge `ReleaseChallenges.memcmp_clang_o2`: the theorem as the repository states
 #      it, proved by `sorry`. Lean's warning "declaration uses `sorry`" there is expected.
 #   2. LEAN4EXPORT (leanprover/lean4export) exports the challenge's theorem, with every constant its statement uses,
 #      from the modules just built.
@@ -28,12 +28,12 @@ PATH="$(elan run leanprover/lean4:v4.35.0 lean --print-prefix)/bin:$PATH"
 echo '== 1. building the challenge ReleaseChallenges.memcmp_clang_o2 (its warning "declaration uses `sorry`" is expected)'
 (
   cd "$project"
-  elan run leanprover/lean4:v4.34.0 lake build ReleaseChallenges.memcmp_clang_o2
+  elan run leanprover/lean4:v4.35.0 lake build ReleaseChallenges.memcmp_clang_o2
 )
 echo "== 2. exporting the challenge's statement"
 (
   cd "$project"
-  elan run leanprover/lean4:v4.34.0 lake env "$exporter" ReleaseChallenges.memcmp_clang_o2 -- Memcmp.clangO2_holds Nat.add Nat.sub Nat.mul Nat.pow Nat.gcd Nat.div Nat.mod Nat.beq Nat.ble Nat.land Nat.lor Nat.xor Nat.shiftLeft Nat.shiftRight String.ofList Char.ofNat List eagerReduce Nat String String.mk Char optParam autoParam semiOutParam outParam propext Quot.sound Classical.choice > "$work/challenge.ndjson"
+  elan run leanprover/lean4:v4.35.0 lake env "$exporter" ReleaseChallenges.memcmp_clang_o2 -- Memcmp.clangO2_holds Nat.add Nat.sub Nat.mul Nat.pow Nat.gcd Nat.div Nat.mod Nat.beq Nat.ble Nat.land Nat.lor Nat.xor Nat.shiftLeft Nat.shiftRight String.ofList Char.ofNat List eagerReduce Nat String String.mk Char optParam autoParam semiOutParam outParam propext Quot.sound Classical.choice > "$work/challenge.ndjson"
 )
 zstd -d -q "$here/solution.ndjson.zst" -o "$work/solution.ndjson"
 config="$here/comparator.json"

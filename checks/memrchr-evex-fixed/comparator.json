@@ -1,0 +1,23 @@
+{
+  "challenge_module": "ReleaseChallenges.memrchr_evex_fixed",
+  "solution_module": "Glibc243Ubuntu.MemrchrRelease",
+  "theorem_names": [
+    "Glibc243Ubuntu.Memrchr.evexFixed_holds"
+  ],
+  "permitted_axioms": [
+    "propext",
+    "Quot.sound",
+    "Classical.choice"
+  ],
+  "external_kernels": {
+    "con-leche": [
+      "con-leche"
+    ],
+    "con-ron": [
+      "con-ron"
+    ],
+    "nanoda": [
+      "nanoda_bin"
+    ]
+  }
+}

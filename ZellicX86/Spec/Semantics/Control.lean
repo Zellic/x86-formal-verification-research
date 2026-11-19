@@ -173,7 +173,9 @@ def Sem.incssp (_ : Inst) : Prog Ctl := do
 by an `XACQUIRE` hint), set outside one; `CF`, `OF`, `SF`, `PF` and `AF` cleared (SDM Vol. 2, "XTEST";
 Vol. 1, 17.3.2). No transaction is ever open in the model: `XBEGIN` is not modelled, and on a processor
 with HLE neither are the hints (the decoder, `finishForm`), so `ZF` is set. The decoder admits `XTEST`
-only on a processor with RTM or HLE (`Features.rtm`, `Features.hle`); on one with neither it is `#UD`. -/
+only on a processor with RTM or HLE (`Features.rtm`, `Features.hle`); on one with neither it is `#UD`.
+The AMD APM does not document XTEST/TSX; unsupported opcodes raise `#UD` under APM
+Vol. 2, §8.2.7. The RTM/HLE execution behavior here is specified by the Intel SDM. -/
 def Sem.xtest (_ : Inst) : Prog Ctl := do
   let f ← readFlags
   writeFlags { f with zf := true, cf := false, of := false, sf := false, pf := false, af := false }

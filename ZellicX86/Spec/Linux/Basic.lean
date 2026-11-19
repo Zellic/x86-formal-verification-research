@@ -35,9 +35,10 @@ def accessError (feat : Features) (pkru : BitVec 32) (m : Mapping) (acc : Access
   (feat.pku && pkeyDenies pkru m.pkey acc) || !m.allows feat (if acc = .write then .write else .read)
 
 /-- Whether access `acc` at address `a`, made with `PKRU` value `pkru`, ends in `SIGBUS`: the page is
-a file page wholly beyond the end of its file, or a kernel page without a source (pages whose fault
-handler returns `VM_FAULT_SIGBUS`), and the kernel's check of the access against the mapping's rights,
-which comes first, passes (`accessError`; otherwise `SIGSEGV`). -/
+a file page wholly beyond the end of its file, a kernel page without a source, or a page of a huge page not yet
+allocated whose allocation failed (`raiseException` asks first; pages whose fault handler returns
+`VM_FAULT_SIGBUS`), and the kernel's check of the access against the mapping's rights, which comes first, passes
+(`accessError`; otherwise `SIGSEGV`). -/
 def sigbusAt (feat : Features) (pkru : BitVec 32) (mem : Memory) (acc : Access) (a : Addr) : Bool :=
   match mem.map (pageOf a) with
   | none => false
@@ -45,7 +46,7 @@ def sigbusAt (feat : Features) (pkru : BitVec 32) (mem : Memory) (acc : Access) 
     !accessError feat pkru m acc &&
       match (mem.backings m.backing).filePage with
       | some fp => mem.files.beyondEof fp
-      | none => (mem.backings m.backing).noSource
+      | none => (mem.backings m.backing).noSource || (mem.backings m.backing).unpopulated
 
 /-- The signal Linux sends for exception `e` raised in user mode with `PKRU` value `pkru`
 (`arch/x86/kernel/traps.c`; for `#PF`, `arch/x86/mm/fault.c`: `SIGBUS` where `sigbusAt` says so, else
@@ -186,7 +187,7 @@ is blocked. -/
 def State.forceSigsegv (s : State) (sig : Signal) : State :=
   let s₁ := if sig = SIGSEGV then s.setAction SIGSEGV { s.proc.sighand SIGSEGV with disp := .default }
     else s
-  s₁.force ⟨SigInfo.kernel SIGSEGV, .kernel⟩
+  s₁.force { info := SigInfo.kernel SIGSEGV, cause := .kernel }
 
 /-- A signal the kernel forces on the process at a point where the model does not deliver to handlers
 (a failed `rseq` update at a return to user mode, `kernelEntry`). The only signal forced here,
@@ -242,7 +243,7 @@ def externalSignal (s : State) (sig : Signal) : StepResult :=
   else if sig = SIGSTOP then .stopped (.notModelled (.feature "a signal that stops the process"))
   else if 32 ≤ sig && s.thread.sigmask.mem sig then
     .stopped (.notModelled (.feature "blocked real-time signal from outside"))
-  else sendNoHandler s ⟨SigInfo.lost sig, .external⟩ false false
+  else sendNoHandler s { info := SigInfo.lost sig, cause := .external } false false
 
 /-- The kernel writes `bs` at `a` in the process's memory with user access rights
 (`put_user`, `copy_to_user`); `none` if some byte is not writable. -/

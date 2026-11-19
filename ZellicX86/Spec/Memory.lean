@@ -108,6 +108,12 @@ structure Mapping where
   pages and those it grew to, also after a split of its VMA (`mm/vma.c` `__split_vma` copies the
   flags). No other mapping the model creates grows down. -/
   growsDown : Bool
+  /-- The page belongs to a mapping of huge pages (`MAP_HUGETLB`, `VM_HUGETLB`), of `2 ^ s` bytes for `some s`
+  (`some 21`: 2 MiB). The mapping starts and ends on that size's boundaries (`sysMmap` rounds and aligns it), and the
+  kernel refuses to split it anywhere else (`mm/hugetlb.c` `hugetlb_vm_op_split`, `Memory.cutsHuge`). Its 4 KiB pages
+  are ordinary private pages to the model, each with its own backing: what the process reads and writes behaves per
+  byte as anywhere; that the kernel backs `2 ^ s` bytes with one page is not visible. `none` for ordinary pages. -/
+  huge : Option Nat := none
 
 /-- The contents behind a mapping. -/
 inductive Backing
@@ -135,6 +141,15 @@ inductive Backing
   unlocked read-modify-write) sees the page either before or after the drop, where the kernel may
   let the read see the old bytes and the write land on the zeros. -/
   | freed (f : Frame)
+  /-- A page of a mapping of huge pages (`Mapping.huge`) whose huge page the kernel has not allocated yet: it
+  allocates and clears the whole huge page at the first fault on any of its pages (`mm/hugetlb.c` `hugetlb_no_page`,
+  `alloc_hugetlb_folio`), which may fail, also for a page the mapping reserved: the hugetlb controller of the process's
+  cgroup charges the page then (`hugetlb_cgroup_charge_cgroup`), and after `madvise(MADV_DONTNEED)` a page beyond the
+  pool's reserve may be missing; the fault then raises `SIGBUS` (`VM_FAULT_SIGBUS`). A failed charge of the memory cgroup
+  instead gives `VM_FAULT_OOM`, and the access is retried (`mm/oom_kill.c` `pagefault_out_of_memory`): to the model a
+  later answer allocates it, or the retries go on (which no run of finitely many steps tells apart). Until then the page is not
+  present (`Memory.check`); its pages read as zeros once it is populated (`Memory.populateHuge`). -/
+  | hugeEmpty
 
 /-- Where a byte is stored: a backing and the offset within its page. -/
 structure ByteLoc where
@@ -214,19 +229,25 @@ def Files.beyondEof (fs : Files) (fp : FilePage) : Bool :=
 /-- The file page behind a backing, if any. -/
 def Backing.filePage : Backing → Option FilePage
   | .cow fp | .file fp => some fp
-  | .priv _ | .kernel _ | .freed _ => none
+  | .priv _ | .kernel _ | .freed _ | .hugeEmpty => none
 
 /-- Whether a backing is a kernel page without a source (`Backing.kernel none`). -/
 def Backing.noSource : Backing → Bool
   | .kernel none => true
   | _ => false
 
+/-- Whether a backing is a page of a huge page not yet allocated (`Backing.hugeEmpty`). -/
+def Backing.unpopulated : Backing → Bool
+  | .hugeEmpty => true
+  | _ => false
+
 /-- The current contents of a backing (zeros for a kernel page without a source, which cannot
-be read). -/
+be read, and for a huge page's page not yet allocated, which reads as zeros once it is). -/
 def Backing.frame (fs : Files) : Backing → Frame
   | .priv f | .freed f => f
   | .kernel f => f.getD fun _ => 0
   | .cow fp | .file fp => fs.page fp
+  | .hugeEmpty => fun _ => 0
 
 /-- Whether the hardware lets user mode perform access `acc` on a page of mapping `m`,
 ignoring protection keys (SDM Vol. 3A, 5.6.1). On x86 every present user page is readable,
@@ -255,12 +276,26 @@ def Memory.check (feat : Features) (pkru : BitVec 32) (mem : Memory) (acc : Acce
   | some m =>
     match (mem.backings m.backing).filePage with
     | some fp => if mem.files.beyondEof fp then some .notPresent else rest m
-    | none => if (mem.backings m.backing).noSource then some .notPresent else rest m
+    | none =>
+      if (mem.backings m.backing).noSource || (mem.backings m.backing).unpopulated then some .notPresent else rest m
 where
   rest (m : Mapping) : Option AccessFault :=
     if feat.pku && pkeyDenies pkru m.pkey acc then some .pkey
     else if !m.allows feat acc then some .protection
     else none
+
+/-- `Memory.check` by the rights alone: as `check`, but a page of a huge page not yet allocated
+(`Backing.hugeEmpty`) counts as present. The first access to such a page that its mapping allows faults, and the kernel
+allocates the huge page and makes the access again, or cannot and signals `SIGBUS` (`mm/hugetlb.c` `hugetlb_no_page`,
+`alloc_hugetlb_folio`; `hugeFault`): `none` says the access is made unless that allocation fails. -/
+def Memory.checkRights (feat : Features) (pkru : BitVec 32) (mem : Memory) (acc : Access)
+    (a : Addr) : Option AccessFault :=
+  match mem.map (pageOf a) with
+  | none => some .notPresent
+  | some m =>
+    match (mem.backings m.backing).filePage with
+    | some fp => if mem.files.beyondEof fp then some .notPresent else check.rest feat pkru acc m
+    | none => if (mem.backings m.backing).noSource then some .notPresent else check.rest feat pkru acc m
 
 /-- The byte at address `a` of a mapped page (0 for an unmapped page; callers check first). -/
 def Memory.readByte (mem : Memory) (a : Addr) : Byte :=
@@ -297,6 +332,8 @@ def Memory.writeByte (mem : Memory) (a : Addr) (v : Byte) : Memory :=
     let o := pageOffset a
     match mem.backings m.backing with
     | .priv f | .freed f => mem.setBacking m.backing (.priv (f.set o v))
+    -- (not reached by the model's stores, which fault on such a page first; as if the kernel allocated it)
+    | .hugeEmpty => mem.setBacking m.backing (.priv (zeroFrame.set o v))
     | .kernel f => mem.setBacking m.backing (.kernel (f.map (·.set o v)))
     | .cow fp => mem.setBacking m.backing (.priv ((mem.files.page fp).set o v))
     | .file fp => { mem with files := mem.files.setPage fp ((mem.files.page fp).set o v) }
@@ -385,6 +422,15 @@ def Memory.prevMapped (mem : Memory) : Nat → Nat → Option Mapping
     | some m => some m
     | none => mem.prevMapped p n
 
+/-- Whether a mapping that ends just before page `e` would lie in the guard gap below a stack: the first mapped page
+among the `gap` from `e` on is of a mapping that grows down. The kernel keeps `stack_guard_gap` free below a stack's start
+(`vm_start_gap`, `include/linux/mm.h`, v6.18), and the placement of a new mapping leaves it so (`vm_unmapped_area`,
+`mm/vma.c`; `generic_get_unmapped_area`, `mm/mmap.c`: `addr + len <= vm_start_gap(vma)` for the next mapping). -/
+def Memory.inStackGap (mem : Memory) (e gap : Nat) : Bool :=
+  match mem.nextMapped (e - 1) gap with
+  | some (_, m) => m.growsDown
+  | none => false
+
 /-- The number of pages from page number `p` up, among the `n` from it, that are mapped by mappings
 with property `P`, up to the first that is not. -/
 def Memory.pagesWhile (mem : Memory) (P : Mapping → Bool) (p : Nat) : Nat → Nat
@@ -422,12 +468,44 @@ fills anonymous pages with zeros when they are first touched, `do_anonymous_page
 def Memory.mapAnon (mem : Memory) (first n : Nat) (prot : Prot) : Memory :=
   { mem with
     map := fun p => if inPages first n p then
-        some ⟨prot, mem.fresh + (p.toNat - first), 0, false, none, mem.fresh, ⟨true, true, true⟩, false⟩
+        some ⟨prot, mem.fresh + (p.toNat - first), 0, false, none, mem.fresh, ⟨true, true, true⟩, false, none⟩
       else mem.map p
     backings := fun i => if mem.fresh ≤ i ∧ i < mem.fresh + n then .priv zeroFrame else mem.backings i
     fresh := mem.fresh + n
     cover := (first, n) :: mem.cover
     covers := mem.covers_add (mem.covers_ite _) }
+
+/-- `mem` with the `n` pages from `first` mapped as `Memory.mapAnon` maps them, as a mapping of huge pages of
+`2 ^ s` bytes (`Mapping.huge`): a private `MAP_HUGETLB` mapping, whose huge pages the kernel allocates and clears at
+their first fault (`Backing.hugeEmpty`, `mm/hugetlb.c` `hugetlb_no_page`). -/
+def Memory.mapHuge (mem : Memory) (first n : Nat) (prot : Prot) (s : Nat) : Memory :=
+  { mem with
+    map := fun p => if inPages first n p then
+        some ⟨prot, mem.fresh + (p.toNat - first), 0, false, none, mem.fresh, ⟨true, true, true⟩, false, some s⟩
+      else mem.map p
+    backings := fun i => if mem.fresh ≤ i ∧ i < mem.fresh + n then .hugeEmpty else mem.backings i
+    fresh := mem.fresh + n
+    cover := (first, n) :: mem.cover
+    covers := mem.covers_add (mem.covers_ite _) }
+
+/-- Whether page `q` is of a mapping of huge pages (`Mapping.huge`) and the page boundary before page `p` is not on one
+of its huge pages' boundaries: a split there would cut a huge page. -/
+def Memory.hugeCut (mem : Memory) (q p : Nat) : Bool :=
+  ((mem.mapAt q).bind (·.huge)).any fun s => p % 2 ^ (s - 12) != 0
+
+/-- Whether changing the mappings of the `n` pages from `first` (`n > 0`) would split a mapping of huge pages inside a
+huge page (`Mapping.huge`), which the kernel refuses (`EINVAL`: `mm/vma.c` `__split_vma`, `mm/hugetlb.c`
+`hugetlb_vm_op_split`): the first page is huge and the range does not start on its huge page's boundary, or the last
+is and the range does not end on one. Since such a mapping starts and ends on its boundaries, these are the only
+places a split could fall. -/
+def Memory.cutsHuge (mem : Memory) (first n : Nat) : Bool :=
+  mem.hugeCut first first || mem.hugeCut (first + n - 1) (first + n)
+
+/-- The first page of the huge page that page `q` is in, if `q` is of a mapping of huge pages; else `q + 1`. -/
+def Memory.hugeStart (mem : Memory) (q : Nat) : Nat :=
+  match (mem.mapAt q).bind (·.huge) with
+  | some s => q / 2 ^ (s - 12) * 2 ^ (s - 12)
+  | none => q + 1
 
 /-- `mem` with the `n` pages from `first` mapped as pages of the mapping `m` grown down to them, a
 stack's growth (`mm/vma.c` `expand_downwards`): new private anonymous memory of zeros (the kernel
@@ -454,7 +532,7 @@ def Memory.mapFile (mem : Memory) (first n : Nat) (prot maxProt : Prot) (fp : Fi
   { mem with
     map := fun p => if inPages first n p then
         some ⟨prot, mem.fresh + (p.toNat - first), 0, false, some (pageAt (p.toNat - first)), mem.fresh, maxProt,
-          false⟩
+          false, none⟩
       else mem.map p
     backings := fun i => if mem.fresh ≤ i ∧ i < mem.fresh + n then
         (if shared then .file (pageAt (i - mem.fresh)) else .cow (pageAt (i - mem.fresh)))
@@ -496,6 +574,23 @@ def Files.bytes (fs : Files) (file : FileId) (pos k : Nat) : List Byte :=
 /-- Whether one of the `n` pages from `first` maps backing `i`. -/
 def Memory.mappedFrom (mem : Memory) (first n i : Nat) : Bool :=
   (List.range n).any fun k => (mem.mapAt (first + k)).any (·.backing = i)
+
+/-- `mem` with the huge page that page `q` is in allocated (`Backing.hugeEmpty`): each of its pages not yet allocated
+holds zeros (`mm/hugetlb.c` `hugetlb_no_page` clears the whole huge page); `mem` itself if `q` is of no mapping of huge
+pages. -/
+def Memory.populateHuge (mem : Memory) (q : Nat) : Memory :=
+  match (mem.mapAt q).bind (·.huge) with
+  | none => mem
+  | some s =>
+    let first := mem.hugeStart q
+    { mem with backings := fun i =>
+        match mem.backings i with
+        | .hugeEmpty => if mem.mappedFrom first (2 ^ (s - 12)) i then .priv zeroFrame else .hugeEmpty
+        | b => b }
+
+/-- `mem` with the huge pages of the `n` pages from `first` allocated (`Memory.populateHuge`). -/
+def Memory.populateHugeRange (mem : Memory) (first n : Nat) : Memory :=
+  (List.range n).foldl (fun m i => m.populateHuge (first + i)) mem
 
 /-- `mem` with the file pages `fps` made zeros (a hole punched into their files,
 `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`); the sizes stay. -/
@@ -589,6 +684,25 @@ def Memory.oneArea (mem : Memory) (first n : Nat) : Bool :=
         m.maxProt = m₀.maxProt ∧ m.origin = m₀.origin.map (fun fp => ⟨fp.file, fp.index + k⟩)) &&
         mem.sharedAt m == mem.sharedAt m₀
 
+/-- The parts of an `mremap(2)` move of the `n` pages from `first` (`mm/mremap.c` `remap_move`, which moves VMA by VMA),
+as offset, length and huge page size (`Mapping.huge`): the runs of mapped pages of which each could be in one VMA with
+the one before it (`Memory.oneArea`), both ordinary pages or both huge pages of one size. A VMA spans no hole and no
+other boundary, so each part holds one VMA or several; where adjacent VMAs within a part meet is not visible to the
+model (`Mapping.area`). That holds for huge pages too: their VMAs are never merged (`VM_DONTEXPAND`, part of
+`VM_SPECIAL`, `mm/vma.c` `vma_merge_existing_range`), but a change that did not split one may still have given some of
+its pages a new area (`Memory.renumber`, as after `mprotect` to the protection the pages have), so a new area does not
+mean a new VMA. Where a part holds several VMAs, what the kernel does when it fails or refuses at a later one, the
+earlier ones moved, is among the outcomes `remapParts` allows for a failure (`Request.memFail`). Built in one scan. -/
+def Memory.moveParts (mem : Memory) (first n : Nat) : List (Nat × Nat × Option Nat) :=
+  -- whether page `first + i + 1` may continue the VMA of page `first + i`
+  let joins (i : Nat) : Bool := mem.oneArea (first + i) 2 &&
+    (mem.mapAt (first + i)).map (·.huge) == (mem.mapAt (first + i + 1)).map (·.huge)
+  (List.range n).foldr (init := []) fun i ps =>
+    match mem.mapAt (first + i), ps with
+    | none, _ => ps
+    | some a, (j, l, h) :: rest => if j = i + 1 && joins i then (i, l + 1, h) :: rest else (i, 1, a.huge) :: ps
+    | some a, [] => [(i, 1, a.huge)]
+
 /-- `mem` with the mapped pages among the `n` from `src` moved to the `n` pages from `dst`
 (`mremap(2)`, which moves the page-table entries, `mm/mremap.c` `move_page_tables`): page `dst + k`
 gets the mapping of page `src + k`, backing included, so that its contents (and, for a file page,
@@ -612,13 +726,14 @@ def Memory.move (mem : Memory) (src dst n : Nat) : Memory :=
           exact .inr (inRuns_cutRuns (by simpa [inPages] using hs) _ (mem.covers p h)) }
 
 /-- The contents a page of mapping `m` shows when it has no contents of its own: for a shared
-file mapping its file page (as always), for a private one its file page (`m.origin`), and for
-anonymous memory zeros. -/
+file mapping its file page (as always), for a private one its file page (`m.origin`), for
+anonymous memory zeros, and for a page of a mapping of huge pages a page not yet allocated (`Backing.hugeEmpty`:
+`madvise(MADV_DONTNEED)` gives the huge page back, `mm/hugetlb.c` `__unmap_hugepage_range`). -/
 def Memory.pristine (mem : Memory) (m : Mapping) : Backing :=
   match mem.backings m.backing, m.origin with
   | .file fp, _ => .file fp
   | _, some fp => .cow fp
-  | _, none => .priv zeroFrame
+  | _, none => if m.huge.isSome then .hugeEmpty else .priv zeroFrame
 
 /-- `mem` with the `n` pages from `first` mapped like mapping `m`, `skip` pages on: with `m`'s
 protection, maximum protection, key, area and growing down, and new backings from `fresh` on, which hold zeros if
@@ -629,7 +744,7 @@ def Memory.mapAs (mem : Memory) (first n : Nat) (m : Mapping) (skip : Nat) : Mem
   { mem with
     map := fun p => if inPages first n p then
         some ⟨m.prot, mem.fresh + (p.toNat - first), m.pkey, false, origin (p.toNat - first), m.area,
-          m.maxProt, m.growsDown⟩
+          m.maxProt, m.growsDown, m.huge⟩
       else mem.map p
     backings := fun i => if mem.fresh ≤ i ∧ i < mem.fresh + n then
         match origin (i - mem.fresh), mem.sharedAt m with

@@ -32,8 +32,8 @@ so then, as without a handler, the process ends. -/
 def vsyscallSegv (prof : Profile) (s : State) (bad : Option Addr := none) (ev : Option Event := none) : Req StepResult :=
   match bad with
   | some a => deliverSignals prof (some ⟨14, 6, some a⟩) ev
-      (s.force ⟨SigInfo.fault SIGSEGV SEGV_MAPERR a, .kernel⟩)
-  | none => deliverSignals prof none ev (s.force ⟨SigInfo.kernel SIGSEGV, .kernel⟩)
+      (s.force { info := SigInfo.fault SIGSEGV SEGV_MAPERR a, cause := .kernel })
+  | none => deliverSignals prof none ev (s.force { info := SigInfo.kernel SIGSEGV, cause := .kernel })
 
 /-- Emulate an instruction fetch from the vsyscall page (`emulate_vsyscall`). Only offsets 0, 0x400 and
 0x800 are entry points; any other offset forces `SIGSEGV`. The kernel first reads the 8-byte return
@@ -51,7 +51,8 @@ IRET/IRETD/IRETQ). `NT` needs no handling: exception entry clears it (SDM Vol. 3
 `IRETQ` restores the saved value. seccomp filters and tracers are assumed absent. -/
 def emulateVsyscall (prof : Profile) (s : State) : Req StepResult := do
   let s := s.modCpu fun c => { c with rflags := { c.rflags with rf := true } }
-  let off := s.cpu.rip.toNat - 0xffffffffff600000
+  -- (the offset in the vsyscall page, whose base is page-aligned; `fetchFault` calls this with `rip` on it)
+  let off := (pageOffset s.cpu.rip).toNat
   if ![0, 0x400, 0x800].contains off then vsyscallSegv prof s else
   let (s, caller) ← copyIn prof s s.cpu.gpr.rsp 8
   match caller with
@@ -79,7 +80,7 @@ def emulateVsyscall (prof : Profile) (s : State) : Req StepResult := do
             { c with rip := ofBytesLE 64 bs, gpr := { c.gpr with rsp := c.gpr.rsp.add 8 } }
           if !t.cpu.rip.canonical prof.feat.la57 then
             deliverSignals prof (some ⟨13, 0, none⟩) ev
-              (t.force ⟨SigInfo.kernel SIGSEGV, .exception (.gp 0)⟩)
+              (t.force { info := SigInfo.kernel SIGSEGV, cause := .exception (.gp 0) })
           else Pure.pure (.running t ev)
 
 end ZellicX86

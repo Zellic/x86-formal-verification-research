@@ -10,14 +10,21 @@ glibc is Copyright (C) the Free Software Foundation, Inc., and others, and is li
 Public License, version 2.1 or (at your option) any later version (`LICENSES/LGPL-2.1.txt`; version 3:
 `LICENSES/LGPL-3.0.txt`, which incorporates `LICENSES/GPL-3.0.txt`). It has NO WARRANTY.
 
-- **`glibc-2.43-ubuntu-26.04-amd64/clients/admin` and `clients/admin2`**: programs statically linked against glibc
-  2.43's static library (`libc.a`, startup files `crt1.o`, `crti.o`, `crtn.o`) from Ubuntu 26.04's package `libc6-dev`
-  2.43-2ubuntu2.4 (amd64). Each contains parts of glibc, which remain under its license. The programs' own code is
-  `clients/admin.c` and `clients/admin2.c`; with `clients/build.sh` they can be relinked against a modified glibc.
-  They also contain parts of GCC's runtime (`crtbeginT.o`, `libgcc_eh.a` from GCC 15.2), which the GCC Runtime Library
-  Exception covers.
-- **The proof exports** (`exports/`, downloaded separately): they contain the bytes of `clients/admin` and
-  `clients/admin2`.
+- **`glibc-2.43-ubuntu-26.04-amd64/libc.a`**: glibc 2.43's static library as Ubuntu 26.04's package `libc6-dev`
+  2.43-2ubuntu2.4 (amd64) ships it (`/usr/lib/x86_64-linux-gnu/libc.a`), unchanged. The theorems about `memrchr`'s
+  variants read their objects from it.
+- **The programs in `glibc-2.43-ubuntu-26.04-amd64/clients/`** (`admin`, `admin2`, each
+  with its own code in the `.c` file of its name): statically linked against glibc 2.43's static library (`libc.a`,
+  startup files `crt1.o`, `crti.o`, `crtn.o`) from Ubuntu 26.04's package `libc6-dev` 2.43-2ubuntu2.4 (amd64). Each
+  contains parts of glibc, which remain under its license; with `clients/build.sh` they can be relinked against a
+  modified glibc. They also contain parts of GCC's runtime (`crtbeginT.o`, `libgcc_eh.a` from GCC 15.2), which the GCC
+  Runtime Library Exception covers.
+- **`glibc-2.43-ubuntu-26.04-amd64/fixed/`**: glibc 2.43's `memrchr-evex.S` and `memrchr-avx2.S`
+  (`sysdeps/x86_64/multiarch/`) each with a change of ours (`memrchr-evex.patch`: one instruction; `memrchr-avx2.patch`:
+  three added instructions), assembled as object files (`memrchr-evex-fixed.o`, `memrchr-avx2-fixed.o`; `build.sh`
+  rebuilds them from glibc's source).
+- **The proof exports** (`exports/`, downloaded separately): they contain the bytes of the files above that their
+  theorems are about (the programs, `libc.a`, the functions' code).
 
 **Source code.** The Corresponding Source of the glibc build these files come from is Ubuntu's source package
 `glibc` 2.43-2ubuntu2.4: https://launchpad.net/ubuntu/+source/glibc/2.43-2ubuntu2.4 (the upstream release, without

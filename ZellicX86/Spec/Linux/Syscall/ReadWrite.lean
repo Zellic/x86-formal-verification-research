@@ -83,7 +83,7 @@ def OpenFile.writeTarget (f : OpenFile) (fs : Files) : Option FileId :=
 `SEND_SIG_NOINFO`, the thread's own process and user id as the sender's; not forced,
 `send_signal_locked`, so a PID namespace's init ignores it, `sigTaskIgnored`). -/
 def writeSignal (s : State) (sig : Signal) : StepResult :=
-  sendNoHandler s ⟨SigInfo.ofSender sig SI_USER s.thread.tid s.thread.uid, .kernel⟩ true false
+  sendNoHandler s { info := SigInfo.ofSender sig SI_USER s.thread.tid s.thread.uid, cause := .kernel } true false
 
 /-- Whether the kernel checks the file size limit itself on a write to the open file `f` that the model
 follows: `f` is on the pages of a regular file (`Files.regular`), whose file system checks it before it

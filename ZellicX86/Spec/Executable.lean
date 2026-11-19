@@ -17,6 +17,10 @@ the one `static` function of the name; its value the function's address and its 
 `execve` maps there (`loadRegions`, `Spec/Linux/Exec.lean`: a segment's file pages mapped from `p_offset` on, a later
 segment's mapping replacing an earlier one's).
 
+A statement about a function of a relocatable object, wherever a static link puts it, says `FnHolds o "fn" needs C`
+(the object an archive's member or an object file: every link places the function, and there it implements `C` on
+every processor with the features `needs`).
+
 A statement about a function of the program says `ImplementsCallIn F.blob prof "fn" ["callee", …] C`: the file has
 the function and the callees named, and their code, each at its symbol's address, implements `C` at the function's
 address (`ImplementsCall`, `Spec/Statement.lean`). That is a statement about those bytes in memory at those addresses
@@ -197,5 +201,17 @@ implement `C` at the function's address (`ImplementsCall`). The names are one li
 not have makes the statement false rather than a statement about other code. -/
 def ImplementsCallIn (e : Blob) (prof : Profile) (fn : String) (callees : List String) (C : Contract) : Prop :=
   Exe.Has e (fn :: callees) ∧ ImplementsCall prof (Exe.entry e fn) ((fn :: callees).map (Exe.seg e)) C
+
+/-- **The function `sym` of the relocatable object `o` implements the contract `C`** on every processor whose features
+satisfy `needs`, wherever a static link puts it: every link places the function (`Obj.linkedFn o L sym` is `some`: the
+object has the function, and the function no relocation a link could fail on, so the rest is about real code), and at
+every link `L` that places it at `e` with the bytes `bs`, in any code that holds those bytes there (`CodeIn`, beside any
+other code), on every processor `prof` with `needs prof.feat`, the code implements `C` at `e` (`ImplementsCall`). The
+object is a `Blob`: an archive's member (`Ar.member A "x.o"`) or an object file's bytes (`#file_image`), so a library's
+shipped function and a fixed build of it are stated alike. -/
+def FnHolds (o : Blob) (sym : String) (needs : Features → Prop) (C : Contract) : Prop :=
+  (∀ L : Link, (Obj.linkedFn o L sym).isSome) ∧
+  ∀ (L : Link) (code : List (Addr × List Byte)) (prof : Profile) (e : Addr) (bs : List Byte),
+    Obj.linkedFn o L sym = some (e, bs) → CodeIn code e bs → needs prof.feat → ImplementsCall prof e code C
 
 end ZellicX86

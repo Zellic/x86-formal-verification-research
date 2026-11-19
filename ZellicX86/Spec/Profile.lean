@@ -91,6 +91,13 @@ structure Features where
   lists, which may then run a critical section as a transaction, and `XTEST` (SDM Vol. 1, 17.3.1.1,
   17.3.1.3). Without HLE those prefixes are ignored. Clear flags leave it open as for `rtm`. -/
   hle : Bool
+  /-- XSAVEC and compacted XRSTOR, with OSXSAVE enabled. A reported
+  CPUID.(EAX=0DH,ECX=1):EAX[1] and enabled XCR0 imply this capability; a clear bit
+  may hide it, as for the other features (SDM Vol. 1 §13.2; APM Vol. 4 XSAVEC). -/
+  xsavec : Bool
+  /-- AVX-512 byte permutations usable: CPUID.(EAX=07H,ECX=0):ECX[1] and
+  enabled AVX-512 state (SDM Vol. 2A CPUID; APM Vol. 3 Appendix E). -/
+  avx512vbmi : Bool := false
   deriving Repr, Inhabited
 
 /-- What Linux tells a new process about the processor in its auxiliary vector
@@ -256,6 +263,8 @@ structure Profile.Consistent (prof : Profile) : Prop where
   sha : prof.reports 7 0 (·.ebx) 29 → prof.feat.sha = true
   /-- `CPUID.(EAX=07H,ECX=0):EBX.AVX512BW[30]`, with AVX-512's state enabled. -/
   avx512bw : prof.reports 7 0 (·.ebx) 30 → prof.enabled xcr0Avx512 → prof.feat.avx512bw = true
+  /-- CPUID.(EAX=07H,ECX=0):ECX.AVX512_VBMI[1], with AVX-512 state enabled. -/
+  avx512vbmi : prof.reports 7 0 (·.ecx) 1 → prof.enabled xcr0Avx512 → prof.feat.avx512vbmi = true
   /-- `CPUID.(EAX=07H,ECX=0):EBX.AVX512VL[31]`, with AVX-512's state enabled. -/
   avx512vl : prof.reports 7 0 (·.ebx) 31 → prof.enabled xcr0Avx512 → prof.feat.avx512vl = true
   /-- `CPUID.(EAX=07H,ECX=0):ECX.OSPKE[4]`: the kernel enabled protection keys (`CR4.PKE`). -/
@@ -266,6 +275,8 @@ structure Profile.Consistent (prof : Profile) : Prop where
   rtm : prof.reports 7 0 (·.ebx) 11 → prof.feat.rtm = true
   /-- `CPUID.(EAX=07H,ECX=0):EBX.HLE[4]`. -/
   hle : prof.reports 7 0 (·.ebx) 4 → prof.feat.hle = true
+  /-- CPUID.(EAX=0DH,ECX=1):EAX[1], with OSXSAVE enabled. -/
+  xsavec : prof.reports 0xD 1 (·.eax) 1 → prof.xcr0.isSome = true → prof.feat.xsavec = true
   /-- `CPUID.(EAX=07H,ECX=1):EDX.APX_F[21]`, with APX's state enabled. -/
   apx : prof.reports 7 1 (·.edx) 21 → prof.enabled xcr0Apx → prof.feat.apx = true
   /-- `CPUID.80000001H:ECX.LZCNT[5]` (AMD: ABM). -/

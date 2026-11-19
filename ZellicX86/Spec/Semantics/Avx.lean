@@ -18,8 +18,13 @@ What is common to the family:
   source is not read. Neither is accessed: their faults are suppressed (SDM Vol. 2, 2.8,
   exception classes E1, E4 and E6, "If fault suppression not set"; AMD APM Vol. 1, 4.13.5, and
   each instruction's page), so such accesses are `Prog.readSel`/`Prog.writeSel` of the selected
-  bytes. The exceptions are the instructions of class E4NF (`VPSHUFB`, `VPMADDWD`, `VPMADDUBSW`, `VPACKSSWB`,
-  `VPACKSSDW`, `VPACKUSWB`, `VPACKUSDW`, `VPSADBW`; the APM: "do not support memory fault suppression"), whose
+  bytes. Extract stores of class E6NF check the entire destination before the selected writes;
+  subvector inserts of class E6NF read the entire narrow source under any mask;
+  Intel word immediate shifts choose a full or selected source read: the SDM instruction pages
+  give E4NF.nb, while Vol. 2A Table 2-45 also lists E4.nb. AMD specifies fault suppression.
+  The other exceptions are the instructions of class E4NF (`VPSHUFB`, `VPALIGNR`, `VPMADDWD`, `VPMADDUBSW`, `VPACKSSWB`,
+  `VPACKSSDW`, `VPACKUSWB`, `VPACKUSDW`, `VPSADBW`, `VPSHUFD/HW/LW`, `VPERMD/Q`,
+  `VPERMT2D`, `VPERMI2D`; the APM: "do not support memory fault suppression"), whose
   memory source is read whole under any opmask. With `k = 0` every element is selected
   and the accesses are ordinary ones. An opmask destination (compares, tests) gets the
   results for the selected elements and 0 for the others and above them.
@@ -27,7 +32,7 @@ What is common to the family:
   loaded and repeated. Under an opmask it is loaded only if the opmask selects an element (fault
   suppression, as for the other masked sources; checked on an AMD Zen 4).
 - **Alignment.** Only the aligned moves (`VMOVDQA`, `VMOVDQA32`, `VMOVDQA64`, `VMOVAPS`, `VMOVAPD`,
-  `VMOVNTDQ`: exception types 1 and E1) need a memory operand aligned to the vector length, also
+  `VMOVNTDQ`, `VMOVNTPS`: exception types 1 and E1) need a memory operand aligned to the vector length, also
   with AMD's misaligned SSE mode on (`MXCSR.MM`, APM Vol. 1, 4.3.2); every other form here takes any
   address (types 4, E4 and E6). The SDM checks the alignment whatever the opmask (Table 2-46); an AMD
   Zen 4 does not when the opmask selects no element in hardware measurements,
@@ -177,6 +182,12 @@ other stores; `SFENCE` orders them) are not visible to the thread itself. The mo
 no memory-ordering model (MODEL-LIMITATIONS.md, "Memory"), so it is an ordinary aligned store. -/
 def Sem.vmovntdq (i : Inst) : Prog Ctl := vmove 8 true i
 
+/-- VEX/EVEX `VMOVNTPS`: an aligned vector store without masking or floating-point
+exceptions. The alignment is the full vector width, even with AMD's `MXCSR.MM`.
+SDM Vol. 2B, MOVNTPS, pp. 4-96–99; AMD APM Vol. 4, MOVNTPS/VMOVNTPS,
+pp. 324–325. The non-temporal ordering limitation is as for `Sem.vmovntdq`. -/
+def Sem.vmovntps (i : Inst) : Prog Ctl := vmove 32 true i
+
 /-- `VPBROADCASTB`, `VPBROADCASTW`, `VPBROADCASTD`, `VPBROADCASTQ` (`e` = 8, 16, 32, 64 bits) from
 a general register, the low element of a vector register, or memory: every element of the
 destination is the source's low `e` bits (SDM Vol. 2, "VPBROADCAST", "VPBROADCASTB/W/D/Q"). -/
@@ -258,32 +269,47 @@ def Sem.vzeroall (prof : Profile) (i : Inst) : Prog Ctl := do
 
 /-! ## Element-wise operations -/
 
-/-- VEX packed shifts by an immediate or by the low 64 bits of an XMM/m128 operand.
+/-- VEX/EVEX packed shifts by an immediate or by the low 64 bits of an XMM/m128 operand.
 Logical shifts saturate to zero at the element width; arithmetic shifts repeat the sign
 bit. Capping the count at `e` preserves these results. A count in memory reads all 16
 bytes and needs no SIMD alignment (SDM Vol. 2B, "PSRLW/PSRLD/PSRLQ",
 "PSLLW/PSLLD/PSLLQ", "PSRAW/PSRAD/PSRAQ", Operation; exception type 7 for immediate forms (MI/VMI), type 4 for count forms;
 AMD APM Vol. 4, the corresponding `VPSRL*`, `VPSLL*`, `VPSRA*` pages). -/
-def vshift (e : Nat) (i : Inst) (f : BitVec e → Nat → BitVec e) : Prog Ctl :=
+def vshift (prof : Profile) (e : Nat) (i : Inst) (f : BitVec e → Nat → BitVec e) : Prog Ctl :=
   match i.ops with
   | [d, s, c] => do
     let w := d.width
-    let a ← readOp w s
+    let km ← maskBits i
+    -- The SDM word-immediate pages give E4NF.nb (e.g. PSLLW, Vol. 2B,
+    -- p. 4-454), but Vol. 2A Table 2-45 also lists them as E4.nb. On Intel
+    -- masked memory forms admit both documented footprints (pick 0: full,
+    -- pick 1: suppressed). AMD specifies suppression (APM Vol. 4,
+    -- PSLLW/PSRAW/PSRLW, pp. 652/658/669); D/Q immediates are E4.
+    let a ← if i.masked then
+        if e = 16 ∧ prof.vendor = .intel then
+          match s with
+          | .mem _ => do
+            let how ← choice 1
+            if how.val = 0 then readOp w s else readSrc i w e km s
+          | _ => readSrc i w e km s
+        else readSrc i w e km s
+      else readOp w s
     let k ← match c with
       | .imm _ k => Pure.pure k
       | _ => do
         let count ← readOp 128 c
         Pure.pure (count.setWidth 64).toNat
-    writeOp d (ofElems w e fun j => f (elem e a j) (min k e))
+    writeMasked i e km d (ofElems w e fun j => f (elem e a j) (min k e))
     done
   | _ => formNotModelled i
 
-/-- VEX `VPSRLW/D/Q`: logical right shift (`vshift`; SDM Vol. 2B, "PSRLW/PSRLD/PSRLQ"). -/
-def Sem.vpsrl (e : Nat) (i : Inst) : Prog Ctl := vshift e i fun a k => a >>> k
-/-- VEX `VPSLLW/D/Q`: logical left shift (`vshift`; SDM Vol. 2B, "PSLLW/PSLLD/PSLLQ"). -/
-def Sem.vpsll (e : Nat) (i : Inst) : Prog Ctl := vshift e i fun a k => a <<< k
-/-- VEX `VPSRAW/D`: arithmetic right shift (`vshift`; SDM Vol. 2B, "PSRAW/PSRAD/PSRAQ"). -/
-def Sem.vpsra (e : Nat) (i : Inst) : Prog Ctl := vshift e i fun a k => a.sshiftRight k
+/-- VEX/EVEX `VPSRLW/D/Q`: logical right shift (`vshift`; SDM Vol. 2B, "PSRLW/PSRLD/PSRLQ"). -/
+def Sem.vpsrl (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl := vshift prof e i fun a k => a >>> k
+/-- VEX/EVEX `VPSLLW/D/Q`: logical left shift (`vshift`; SDM Vol. 2B, "PSLLW/PSLLD/PSLLQ"). -/
+def Sem.vpsll (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl := vshift prof e i fun a k => a <<< k
+/-- VEX `VPSRAW/D` and EVEX `VPSRAW/D/Q`: arithmetic right shift (`vshift`; SDM Vol. 2B,
+"PSRAW/PSRAD/PSRAQ"). -/
+def Sem.vpsra (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl := vshift prof e i fun a k => a.sshiftRight k
 
 /-- VEX `VPINSRB/D/Q`: insert the low `e` bits of a general register or memory into
 element `imm8 mod (128/e)` of the first vector source. Clear ZMM bits above 127.
@@ -299,7 +325,7 @@ def Sem.vpinsr (e : Nat) (i : Inst) : Prog Ctl :=
     done
   | _ => formNotModelled i
 
-/-- VEX `VPEXTRB/D/Q`: extract element `imm8 mod (128/e)` to memory or a general
+/-- VEX/EVEX `VPEXTRB/W/D/Q`: extract element `imm8 mod (128/e)` to memory or a general
 register, zero-extending a register destination. No vector state is written. Memory
 writes exactly `e/8` bytes with no SIMD alignment requirement (SDM Vol. 2B,
 "PEXTRB/PEXTRD/PEXTRQ", VEX Operation and exception type 5; AMD APM Vol. 4,
@@ -367,6 +393,262 @@ def Sem.vextracti128 (i : Inst) : Prog Ctl := vextractHalf i
 /-- `VEXTRACTF128` (`vextractHalf`; SDM Vol. 2C, "VEXTRACTF128"). -/
 def Sem.vextractf128 (i : Inst) : Prog Ctl := vextractHalf i
 
+/-- EVEX extraction of an `n`-bit subvector (`n` = 128 or 256), masked per `e`-bit
+element. Only the low selector bits are used. A register destination merges/zeroes
+and clears bits above `n`; a memory destination checks the entire `n/8` bytes before
+writing selected elements, including with an empty mask: E6NF does not suppress
+memory faults. SDM Vol. 2C, VEXTRACTF128/…, pp. 5-165–172, VEXTRACTI128/…,
+pp. 5-173–179, and Vol. 2A Table 2-56; AMD APM Vol. 4, VEXTRACTF32X4/…,
+pp. 1000–1007 and VEXTRACTI32X4/…, pp. 1010–1017. No FP exceptions. -/
+def vextract (e n : Nat) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s, .imm _ k] => do
+    let a ← readOp s.width s
+    let r := elem n a (k % (s.width / n))
+    let km ← maskBits i
+    match d with
+    | .mem x =>
+      let m ← memRef x
+      checkAccesses [(m, .write, n / 8)]
+      writeSel m (n / 8) (byteSel e (n / 8) km) (r.setWidth (8 * (n / 8)))
+    | _ => writeMasked i e km d r
+    done
+  | _ => formNotModelled i
+
+/-- EVEX `VEXTRACTI32X4/I64X2/I32X8/I64X4` (`vextract`). -/
+def Sem.vextracti (e n : Nat) (i : Inst) : Prog Ctl := vextract e n i
+/-- EVEX `VEXTRACTF32X4/F64X2/F32X8/F64X4` (`vextract`): bit moves. -/
+def Sem.vextractf (e n : Nat) (i : Inst) : Prog Ctl := vextract e n i
+
+/-- EVEX insertion of an `n`-bit subvector (`n` = 128 or 256) into the full-width
+first source, selecting field `imm8 mod (VL/n)`. Read the entire narrow source
+at any alignment before destination-element masking, including an empty mask:
+E6NF does not suppress memory faults. Masked-off destination elements merge or
+zero, and bits above VL clear. Floating forms move bits without FP exceptions.
+SDM Vol. 2C VINSERTI128/… pp. 5-411–415, VINSERTF128/… pp. 5-405–410;
+AMD APM Vol. 4 VINSERTI32X4/… pp. 1208–1211, VINSERTF32X4/… pp. 1202–1205. -/
+def vinsert (e n : Nat) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s₁, s₂, .imm _ k] => do
+    let w := d.width
+    let a ← readOp w s₁
+    let b ← readOp n s₂
+    let r := ofElems w n fun j => if j = k % (w / n) then b else elem n a j
+    let km ← maskBits i
+    writeMasked i e km d r
+    done
+  | _ => formNotModelled i
+
+/-- EVEX `VINSERTI32X4/I64X2/I32X8/I64X4` (`vinsert`). -/
+def Sem.vinserti (e n : Nat) (i : Inst) : Prog Ctl := vinsert e n i
+/-- EVEX `VINSERTF32X4/F64X2/F32X8/F64X4` (`vinsert`): bit moves. -/
+def Sem.vinsertf (e n : Nat) (i : Inst) : Prog Ctl := vinsert e n i
+
+/-- VEX/EVEX sign/zero extension of low packed elements. EVEX masking uses
+one bit per destination element; a selected bit reads exactly the corresponding
+source element's bytes, so a masked-off source element cannot fault. A register
+destination merges or zeroes at the widened element size and clears bits above
+its vector width. SDM Vol. 2B PMOVSX/PMOVZX, EVEX Operation and exception type E5;
+AMD APM Vol. 4 pp. 563–598, each EVEX form supports memory fault suppression. -/
+def Sem.vpmovx (signed : Bool) (sourceBits targetBits : Nat) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s] => do
+    let w := d.width
+    let km ← maskBits i
+    let a ← readSrc i (w / targetBits * sourceBits) sourceBits km s
+    writeMasked i targetBits km d (ofElems w targetBits fun j =>
+      let v := elem sourceBits a j
+      if signed then BitVec.signExtend targetBits v else v.setWidth targetBits)
+    done
+  | _ => formNotModelled i
+
+/-- VEX/EVEX immediate shuffles within each 128-bit lane: doublewords (`e=32`),
+or the low/high four words (`e=16`, `hi`). The other words are copied. Memory
+reads the complete vector at any alignment, even under an empty opmask (E4NF).
+EVEX masks result elements; VPSHUFD also accepts a scalar broadcast. Flags and MXCSR are unchanged.
+SDM Vol. 2B, PSHUFD pp. 4-426–429, PSHUFHW pp. 4-430–432,
+PSHUFLW pp. 4-433–435; AMD APM Vol. 4, the same entries, pp. 628–637. -/
+def Sem.vpshuf (e : Nat) (hi : Bool) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s, .imm _ k] => do
+    let w := d.width
+    let a ← readOp w s
+    let km ← maskBits i
+    writeMasked i e km d (ofElems w e fun j =>
+      let base := j / (128 / e) * (128 / e)
+      let pos :=  j % (128 / e)
+      let first := if hi then 4 else 0
+      if e = 32 then elem e a (base + k / 4 ^ pos % 4)
+      else if first ≤ pos && pos < first + 4 then
+        elem e a (base + first + k / 4 ^ (pos - first) % 4)
+      else elem e a j)
+    done
+  | _ => formNotModelled i
+
+/-- VEX/EVEX byte shifts independently in each 128-bit lane. Counts above 15 clear
+all lanes; no bytes cross a lane boundary. VEX has a register source; EVEX also
+reads a full-width memory source, without masking or broadcast. SDM Vol. 2B,
+PSRLDQ pp. 4-465–467, PSLLDQ pp. 4-441–443; AMD APM Vol. 4,
+PSRLDQ/VPSRLDQ pp. 664–665, PSLLDQ/VPSLLDQ pp. 647–648. -/
+def Sem.vpshiftdq (left : Bool) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s, .imm _ k] => do
+    let a ← readOp d.width s
+    writeOp d (ofElems d.width 128 fun j =>
+      if left then elem 128 a j <<< (8 * k) else elem 128 a j >>> (8 * k))
+    done
+  | _ => formNotModelled i
+
+/-- Lane-local variable permutation of raw `e`-bit elements, with each selector
+starting at control bit `bit`. Kept as a value-level definition so stepping
+leaves element arithmetic folded, with either documented Intel selector bit. -/
+def permilVarValue (w e bit : Nat) (a ix : BitVec w) : BitVec w :=
+  ofElems w e fun j =>
+    let n := 128 / e
+    elem e a (j / n * n + (elem e ix j).toNat / 2^bit % n)
+
+/-- VPERMILPS/PD select raw elements within each 128-bit lane. PS immediate
+selectors repeat every lane; PD uses one immediate bit per output quadword.
+Variable PS uses each control doubleword's low two bits. For variable PD,
+AMD specifies bit 1 (APM Vol.4 p.1362). Intel's description says bit 0,
+while Figure 5-24 and the operation use bit 1 (SDM Vol.2C pp.5-512, 5-514–515):
+Intel picks either reading (pick 0: bit 0; pick 1: bit 1). Every memory data or
+control source, including scalar broadcast, is read unconditionally (E4NF).
+Masks apply to destination elements; flags and MXCSR are unchanged.
+SDM Vol.2C pp.5-511–521; APM Vol.4 pp.1362–1367. -/
+def Sem.vpermil (prof : Profile) (e : Nat) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s, .imm _ k] => do
+    let w := d.width
+    let a ← readOp w s
+    let km ← maskBits i
+    writeMasked i e km d (ofElems w e fun j =>
+      let n := 128 / e
+      let selector := if e = 64 then k / 2^j % 2 else k / 4^(j%4) % 4
+      elem e a (j / n * n + selector))
+    done
+  | [d, s, controls] => do
+    let w := d.width
+    let a ← readOp w s
+    let ix ← readOp w controls
+    let km ← maskBits i
+    if e = 64 ∧ prof.vendor = .intel then
+      let k ← choice 1
+      if k.val = 0 then
+        writeMasked i e km d (permilVarValue w e 0 a ix)
+      else
+        writeMasked i e km d (permilVarValue w e 1 a ix)
+    else
+      writeMasked i e km d (permilVarValue w e (if e = 64 then 1 else 0) a ix)
+    done
+  | _ => formNotModelled i
+
+/-- VPERMQ immediate control permutes each four-quadword group independently
+(VEX.256, EVEX.256/512). Vector control selects any quadword of the whole vector
+(EVEX.256/512). EVEX merges/zeroes under a per-quadword mask. Memory reads the
+full vector or the scalar broadcast unconditionally (E4NF), even with an empty
+mask. Flags/MXCSR unchanged. SDM Vol. 2C VPERMQ pp. 5-529–532;
+AMD APM Vol. 4 VPERMQ pp. 1373–1375. -/
+def Sem.vpermq (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s, .imm _ k] => do
+    let w := d.width
+    let a ← readOp w s
+    let km ← maskBits i
+    writeMasked i 64 km d (ofElems w 64 fun j =>
+      elem 64 a (j / 4 * 4 + k / 4 ^ (j % 4) % 4))
+    done
+  | [d, indices, s] => do
+    let w := d.width
+    let ix ← readOp w indices
+    let a ← readOp w s
+    let km ← maskBits i
+    writeMasked i 64 km d (ofElems w 64 fun j =>
+      elem 64 a ((elem 64 ix j).toNat % (w / 64)))
+    done
+  | _ => formNotModelled i
+
+/-- Full-vector byte/word/doubleword permutation. Each index element's low bits
+select an element anywhere in the data source. EVEX masking is per element and
+memory is read in full even with an empty mask (E4NF); D also has VEX.256.
+Flags and MXCSR are unchanged. SDM Vol.2C VPERMB pp.5-498–499,
+VPERMD/VPERMW pp.5-500–502; APM Vol.4 pp.1338–1341, 1387–1388. -/
+def Sem.vperm (e : Nat) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, indices, s] => do
+    let w := d.width
+    let ix ← readOp w indices
+    let a ← readOp w s
+    let km ← maskBits i
+    writeMasked i e km d (ofElems w e fun j => elem e a ((elem e ix j).toNat % (w / e)))
+    done
+  | _ => formNotModelled i
+
+/-- Two-table byte/word/doubleword/quadword permutation. VPERMI2* (`overwriteIndex`) reads its
+indices from the old destination and table 0 from the first explicit source;
+VPERMT2* reads table 0 from the old destination and indices from the first
+source. Selector bit `log2(w/e)` chooses the table; lower bits choose its element.
+Masking merges/zeroes destination elements. Memory table 1 (or its scalar
+broadcast) is read even with an empty mask (E4NF). Flags/MXCSR unchanged.
+SDM Vol. 2C VPERMI2D pp. 5-505–510, VPERMT2D pp. 5-535–540;
+AMD APM Vol.4 VPERMI2B/W/D/Q pp.1342–1353 and VPERMT2B/W/D/Q pp.1375–1386.
+Byte forms: SDM pp.5-503–504, 5-533–534. Word/quadword forms: pp.5-505–510,
+5-535–540. Byte/word EVEX.b=1 is not decoded (APM prose/table disagreement). -/
+def Sem.vperm2 (e : Nat) (overwriteIndex : Bool) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s₁, s₂] => do
+    let w := d.width
+    let old ← readOp w d
+    let first ← readOp w s₁
+    let second ← readOp w s₂
+    let km ← maskBits i
+    let indices := if overwriteIndex then old else first
+    let table0 := if overwriteIndex then first else old
+    let n := w / e
+    writeMasked i e km d (ofElems w e fun j =>
+      let selector := (elem e indices j).toNat % (2 * n)
+      elem e (if selector < n then table0 else second) (selector % n))
+    done
+  | _ => formNotModelled i
+
+/-- VSHUFI32X4/64X2 and VSHUFF32X4/64X2 select 128-bit blocks. The low
+destination half selects from source 1, the high half from source 2. At VL=256
+imm8 bits 0/1 select the two blocks; at VL=512 four 2-bit selectors apply.
+EVEX masks at 32/64-bit granularity. The entire memory source or broadcast is
+read even with an empty mask (E4NF); flags/MXCSR are unchanged, including NaNs.
+SDM Vol.2C pp.5-750–754; APM Vol.4 pp.1739–1746. -/
+def Sem.vshuf128 (e : Nat) (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s₁, s₂, .imm _ k] => do
+    let w := d.width
+    let a ← readOp w s₁
+    let b ← readOp w s₂
+    let km ← maskBits i
+    let n := w / 128
+    let radix := if w = 256 then 2 else 4
+    let result := ofElems w 128 fun j =>
+      elem 128 (if j < n / 2 then a else b) (k / radix ^ j % n)
+    writeMasked i e km d result
+    done
+  | _ => formNotModelled i
+
+/-- VEX.256 VPERM2I128: each half selects one of the four source halves,
+or zero when its immediate nibble's bit 3 is set. Bits 2 and 6 are ignored.
+Full 32-byte memory read at any alignment, even when both halves select zero.
+Upper ZMM bits cleared, flags/MXCSR unchanged. SDM Vol. 2C VPERM2I128
+pp. 5-496–497; AMD APM Vol. 4 VPERM2I128 pp. 1336–1337. -/
+def Sem.vperm2i128 (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s₁, s₂, .imm _ k] => do
+    let a ← readOp 256 s₁
+    let b ← readOp 256 s₂
+    writeOp d (ofElems 256 128 fun j =>
+      let ctl := k / 16 ^ j
+      if ctl / 8 % 2 = 1 then 0
+      else elem 128 (if ctl % 4 < 2 then a else b) (ctl % 2))
+    done
+  | _ => formNotModelled i
+
 /-- A vector operation `d := f s₁ s₂` on `esz`-bit elements, merging or zeroing under the
 opmask (exception types 4 and E4: any alignment). Without fault suppression (`nf`, class E4NF)
 a memory source is read whole whatever the opmask. -/
@@ -429,6 +711,18 @@ within each 128-bit lane: SDM Vol. 2, "UNPCKLPS", ..., Operation "VUNPCKLPS (VEX
 version)"); `f` gets the lane's index. -/
 def perLane128 (f : Nat → BitVec 128 → BitVec 128 → BitVec 128) {w : Nat} (a b : BitVec w) : BitVec w :=
   ofElems w 128 fun l => f l (elem 128 a l) (elem 128 b l)
+
+/-- VEX/EVEX `VPALIGNR`: within each 128-bit lane, shift `src1:src2` right by
+`imm8` bytes, retaining 128 bits (zero at counts ≥ 32). Byte masking merges/zeroes
+inactive outputs; the whole memory source is read even under an empty mask or a
+zero-producing count (E4NF). Upper bits clear. SDM Vol. 2B PALIGNR, pp. 4-216–219;
+AMD APM Vol. 4 PALIGNR/VPALIGNR, pp. 419–421. No memory SIMD alignment requirement. -/
+def Sem.vpalignr (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [d, s₁, s₂, .imm _ k] =>
+    vbinop 8 { i with ops := [d, s₁, s₂] }
+      (perLane128 fun _ a b => (((a ++ b) >>> (8 * k)).setWidth 128)) (nf := true)
+  | _ => formNotModelled i
 
 /-- `VUNPCKLPS` (VEX; SDM Vol. 2, "UNPCKLPS"): `interleave` of the low doublewords per lane. -/
 def Sem.vunpcklps (i : Inst) : Prog Ctl := vbinop 32 i (perLane128 fun _ a b => ofDwords (interleave 32 0 a b))
@@ -791,14 +1085,84 @@ def Sem.knot (e : Nat) (i : Inst) : Prog Ctl :=
     done
   | _ => formNotModelled i
 
+/-- The address of gather element `j`: signed dword/qword vector index, SIB scale,
+base and displacement, truncated at the address size before adding FS/GS (SDM Vol. 2C,
+gathers, Operation; APM Vol. 4 §1.3 "VSIB Addressing"). -/
+def gatherRef (v : VsibOp) (indices : BitVec 512) (j : Nat) : Prog MemRef := do
+  let base ← match v.base with
+    | some b => readReg (regOf b)
+    | none => Pure.pure 0
+  let idx := (elem v.indexBits indices j).signExtend 64
+  let off := base + idx * BitVec.ofNat 64 v.scale + BitVec.ofNat 64 v.disp
+  let off := if v.addr32 then off.setWidth 32 |>.setWidth 64 else off
+  let addr ← match v.seg with
+    | some .fs => do let b ← segBase true; Pure.pure (b + off)
+    | some .gs => do let b ← segBase false; Pure.pure (b + off)
+    | _ => Pure.pure off
+  let fsgs := v.seg == some .fs || v.seg == some .gs
+  Pure.pure ⟨addr, (v.base == some 4 || v.base == some 5) && !fsgs⟩
+
+/-- Gather selected dword/qword elements using signed VSIB indices. VEX selects by the
+mask elements' sign bits; EVEX by opmask bits. Successful execution merges inactive elements,
+clears the entire mask and zeroes destination bits above the gathered range, including the
+unused half with qword indices and dword data (SDM Vol. 2C, VPGATHERDD/DQ/QD/QQ and
+VGATHERDPS/DPD/QPS/QPD, Operation; APM Vol. 4, the corresponding gathers).
+
+A selected access that faults stops explicitly not modelled (`readGather`); it never produces
+a rolled-back exception. Partial-fault progress and interleaving inside the instruction need
+the committed-state/atomicity model. Alignment-checking mode is also not modelled: the SDM
+exempts gathers from AC, whereas APM Vol. 4's VEX exception tables list AC conditions. -/
+def Sem.gather (i : Inst) : Prog Ctl :=
+  match i.ops with
+  | [.vreg d w, .vsib v] | [.vreg d w, .vsib v, .vreg _ _] => do
+    let e := v.dataWidth
+    let n := min (w / e) (v.indexWidth / v.indexBits)
+    let indices ← readZmm (xmmOf v.indexReg)
+    let prior ← readOp w (.vreg d w)
+    let mask ← match i.ops with
+      | [_, _, .vreg m _] => readZmm (xmmOf m)
+      | _ => Pure.pure 0
+    let km ← maskBits i
+    let mut result : BitVec w := 0
+    for j in List.range n do
+      let selected := if i.masked then km.getLsbD j else (elem e mask j).getLsbD (e-1)
+      let value ← if selected then do
+          let m ← gatherRef v indices j
+          readGather m e
+        else Pure.pure (elem e prior j)
+      result := result ||| (value.setWidth w <<< (e*j))
+    writeOp (.vreg d w) result
+    match i.ops with
+    | [_, _, .vreg m _] => writeZmm (xmmOf m) 0
+    | _ => match i.mask with
+      | some k => writeK (kOf k) 0
+      | none => Pure.pure ()
+    done
+  | _ => formNotModelled i
+
 /-- Execute VEX or EVEX instruction `i` of mnemonic `m`, with `rip` already advanced past it. -/
 def execAvx (prof : Profile) (m : AvxMn) (i : Inst) : Prog Ctl :=
   match m with
+  | .vpmovsxbw => Sem.vpmovx true 8 16 i
+  | .vpmovsxbd => Sem.vpmovx true 8 32 i
+  | .vpmovsxbq => Sem.vpmovx true 8 64 i
+  | .vpmovsxwd => Sem.vpmovx true 16 32 i
+  | .vpmovsxwq => Sem.vpmovx true 16 64 i
+  | .vpmovsxdq => Sem.vpmovx true 32 64 i
+  | .vpmovzxbw => Sem.vpmovx false 8 16 i
+  | .vpmovzxbd => Sem.vpmovx false 8 32 i
+  | .vpmovzxbq => Sem.vpmovx false 8 64 i
+  | .vpmovzxwd => Sem.vpmovx false 16 32 i
+  | .vpmovzxwq => Sem.vpmovx false 16 64 i
+  | .vpmovzxdq => Sem.vpmovx false 32 64 i
+  | .vpgatherdd | .vpgatherdq | .vpgatherqd | .vpgatherqq
+  | .vgatherdps | .vgatherdpd | .vgatherqps | .vgatherqpd => Sem.gather i
   | .vmovdqu => Sem.vmovdqu i | .vmovdqa => Sem.vmovdqa i | .vmovdqu8 => Sem.vmovdqu8 i
   | .vmovdqu16 => Sem.vmovdqu16 i | .vmovdqu32 => Sem.vmovdqu32 i
   | .vmovdqu64 => Sem.vmovdqu64 i | .vmovdqa32 => Sem.vmovdqa32 i
   | .vmovdqa64 => Sem.vmovdqa64 i
   | .vmovups => Sem.vmovups i | .vmovaps => Sem.vmovaps i | .vmovntdq => Sem.vmovntdq i
+  | .vmovntps => Sem.vmovntps i
   | .vpxor => Sem.vpxor i | .vpxord => Sem.vpxord i | .vpxorq => Sem.vpxorq i
   | .vpor => Sem.vpor i | .vpord => Sem.vpord i | .vporq => Sem.vporq i
   | .vpand => Sem.vpand i | .vpandd => Sem.vpandd i | .vpandq => Sem.vpandq i
@@ -825,15 +1189,33 @@ def execAvx (prof : Profile) (m : AvxMn) (i : Inst) : Prog Ctl :=
   | .vpackssdw => Sem.vpackssdw i
   | .vpackusdw => Sem.vpackusdw i
   | .vpsubus e => Sem.vpsubus e i | .vpmuludq => Sem.vpmuludq i | .vpackuswb => Sem.vpackuswb i
-  | .vpshufb => Sem.vpshufb i | .vpmovmskb => Sem.vpmovmskb i
+  | .vpshufb => Sem.vpshufb i
+  | .vpalignr => Sem.vpalignr i | .vpmovmskb => Sem.vpmovmskb i
   | .vpbroadcast e => Sem.vpbroadcast e i | .vbroadcastss => Sem.vbroadcastss i
   | .vzeroupper => Sem.vzeroupper prof i
   | .vzeroall => Sem.vzeroall prof i
   | .vmovd => Sem.vmovd i | .vmovq => Sem.vmovq i
-  | .vpsrl e => Sem.vpsrl e i | .vpsll e => Sem.vpsll e i | .vpsra e => Sem.vpsra e i
+  | .vpsrl e => Sem.vpsrl prof e i | .vpsll e => Sem.vpsll prof e i | .vpsra e => Sem.vpsra prof e i
   | .vpinsr e => Sem.vpinsr e i | .vpextr e => Sem.vpextr e i
   | .vpunpcklqdq => Sem.vpunpcklqdq i | .vpunpckhqdq => Sem.vpunpckhqdq i
+  | .vpshufd => Sem.vpshuf 32 false i | .vpshuflw => Sem.vpshuf 16 false i
+  | .vpshufhw => Sem.vpshuf 16 true i
+  | .vpsrldq => Sem.vpshiftdq false i | .vpslldq => Sem.vpshiftdq true i
+  | .vpermilps => Sem.vpermil prof 32 i | .vpermilpd => Sem.vpermil prof 64 i
+  | .vpermps => Sem.vperm 32 i | .vpermpd => Sem.vpermq i
+  | .vpermi2ps => Sem.vperm2 32 true i | .vpermi2pd => Sem.vperm2 64 true i
+  | .vpermt2ps => Sem.vperm2 32 false i | .vpermt2pd => Sem.vperm2 64 false i
+  | .vpermq => Sem.vpermq i | .vpermd => Sem.vperm 32 i | .vperm2i128 => Sem.vperm2i128 i
+  | .vpermb => Sem.vperm 8 i | .vpermw => Sem.vperm 16 i
+  | .vpermi2b => Sem.vperm2 8 true i | .vpermt2b => Sem.vperm2 8 false i
+  | .vpermi2w => Sem.vperm2 16 true i | .vpermt2w => Sem.vperm2 16 false i
+  | .vpermi2d => Sem.vperm2 32 true i | .vpermt2d => Sem.vperm2 32 false i
+  | .vpermi2q => Sem.vperm2 64 true i | .vpermt2q => Sem.vperm2 64 false i
+  | .vshufi32x4 | .vshuff32x4 => Sem.vshuf128 32 i
+  | .vshufi64x2 | .vshuff64x2 => Sem.vshuf128 64 i
   | .vinserti128 => Sem.vinserti128 i | .vextracti128 => Sem.vextracti128 i
+  | .vextracti e n => Sem.vextracti e n i | .vextractf e n => Sem.vextractf e n i
+  | .vinserti e n => Sem.vinserti e n i | .vinsertf e n => Sem.vinsertf e n i
   | .vinsertf128 => Sem.vinsertf128 i | .vextractf128 => Sem.vextractf128 i
   | .vmovupd => Sem.vmovupd i | .vmovapd => Sem.vmovapd i | .vmovss => Sem.vmovss i
   | .vmovddup => Sem.dup false true false i

@@ -354,23 +354,27 @@ def exceptionInfo (feat : Features) (s : State) (pf : BitVec 2) : Exception → 
 exception leaves: before the instruction for a fault, after it for `#BP`, a trap): the kernel forces
 the exception's signal (`exceptionSignal`) on the thread (`State.force`); without a handler, or with
 the signal blocked or ignored, it ends the process, and otherwise the kernel delivers it, first of
-the pending signals (`deliverSignals`). `#NM` in user mode is not modelled. -/
-def signalException (prof : Profile) (s : State) (e : Exception) : Req StepResult :=
+the pending signals (`deliverSignals`). `cause` is why it was sent (`KillCause`), which the outcome reports if it ends
+the process here: the exception, unless given (`raiseException`'s refused huge page, `KillCause.hugeFault`); the queue
+entry of a signal delivered to a handler records the exception (`Queued.notHuge`). `#NM` in user mode is not
+modelled. -/
+def signalException (prof : Profile) (s : State) (e : Exception) (cause : KillCause := .exception e) :
+    Req StepResult :=
   match exceptionSignal prof.feat s.cpu.pkru s.proc.mm.mem e with
   | none => Pure.pure (.stopped (.notModelled (.feature "#NM in user mode")))
   | some sig =>
     let a := s.proc.sighand sig
     match a.disp with
     | .handler _ =>
-      if s.thread.sigmask.mem sig then Pure.pure (.stopped (.killed sig (.exception e))) else do
+      if s.thread.sigmask.mem sig then Pure.pure (.stopped (.killed sig cause)) else do
       let pf : BitVec 2 ← Req.request (.undefined 2)
       match exceptionInfo prof.feat s pf e with
       | none => Pure.pure (.stopped (.notModelled (.signalHandler sig)))
       | some (info, trap) =>
         -- the processor saves `RF` set for a fault (SDM Vol. 3B, 20.3.1.1)
         let sF := if e = .bp then s else s.modCpu fun c => { c with rflags := { c.rflags with rf := true } }
-        deliverSignals prof (some trap) none (sF.force ⟨info, .exception e⟩)
-    | _ => Pure.pure (.stopped (.killed sig (.exception e)))
+        deliverSignals prof (some trap) none (sF.force { info := info, cause := .exception e })
+    | _ => Pure.pure (.stopped (.killed sig cause))
 
 /-- What exception `e`, raised by the current instruction, does to the process (the state `s` is the
 one the exception leaves: before the instruction for a fault, after it for `#BP`, a trap). For `#PF` at
@@ -380,11 +384,18 @@ checks the access again on the grown mapping (`access_error`): allowed, it retur
 instruction, which runs again at the next step (with `RF` set, as the processor saved it for the
 fault, SDM Vol. 3B, 20.3.1.1); not allowed (a fetch from a stack without `PROT_EXEC`, a write to one
 made read-only, a protection key), it signals the fault on the grown state, which the growth stays
-in. Otherwise, and for every other exception, its signal (`signalException`). -/
+in. For `#PF` on a page of a huge page not yet allocated whose mapping allows the access (`hugeFaultAt`),
+the handler allocates the huge page and returns to the instruction, or the allocation fails and it
+signals `SIGBUS` (`hugeFault`, `sigbusAt`), sent for `KillCause.hugeFault`. Otherwise, and for every other exception,
+its signal (`signalException`). -/
 def raiseException (prof : Profile) (s : State) (e : Exception) : Req StepResult :=
   match e with
   | .pf a acc _ =>
-    if (s.proc.mm.mem.map (pageOf a)).isNone && decide (a.toNat < taskSize prof.feat) then do
+    if hugeFaultAt prof.feat s.cpu.pkru s.proc.mm.mem acc a then do
+      match ← hugeFault s a with
+      | some s' => Pure.pure (.running (s'.modCpu fun c => { c with rflags := { c.rflags with rf := true } }) none)
+      | none => signalException prof s e (.hugeFault a)
+    else if (s.proc.mm.mem.map (pageOf a)).isNone && decide (a.toNat < taskSize prof.feat) then do
       match ← growStack prof s a with
       | some s' =>
         if (s'.proc.mm.mem.check prof.feat s'.cpu.pkru acc a).isNone then

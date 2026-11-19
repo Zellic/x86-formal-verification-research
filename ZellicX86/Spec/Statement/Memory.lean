@@ -61,6 +61,18 @@ features `feat` (`Memory.check`, with the thread's `PKRU`). -/
 def Accessible (feat : Features) (s : State) (acc : Access) (r : Rgn) : Prop :=
   ∀ a, r.Mem a → a.canonical feat.la57 = true ∧ s.proc.mm.mem.check feat s.cpu.pkru acc a = none
 
+/-- Every byte of `r` is canonical and its mapping allows access `acc` in `s` on a processor with features `feat`
+(`Memory.checkRights`, with the thread's `PKRU`): `Accessible` but for pages of huge pages not yet allocated
+(`Backing.hugeEmpty`), whose first access may still end in `SIGBUS` when the kernel cannot allocate the huge page
+(`hugeFault`). `Accessible` is this with every page allocated (`Populated`). -/
+def Allowed (feat : Features) (s : State) (acc : Access) (r : Rgn) : Prop :=
+  ∀ a, r.Mem a → a.canonical feat.la57 = true ∧ s.proc.mm.mem.checkRights feat s.cpu.pkru acc a = none
+
+/-- No byte of `r` lies on a mapped page of a huge page the kernel has not allocated yet (`Backing.hugeEmpty`). -/
+def Populated (s : State) (r : Rgn) : Prop :=
+  ∀ a, r.Mem a → ∀ m, s.proc.mm.mem.map (pageOf a) = some m →
+    (s.proc.mm.mem.backings m.backing).unpopulated = false
+
 /-- Where the byte at virtual address `a` is stored in `s`, if its page is mapped. -/
 def byteLoc (s : State) (a : Addr) : Option ByteLoc :=
   (s.proc.mm.mem.map (pageOf a)).map fun m => ⟨m.backing, pageOffset a⟩
@@ -100,6 +112,21 @@ an allocator owns is ordinary memory it may give back (`munmap`, lowering the br
 def NotFixed (s : State) (rs : List Rgn) : Prop :=
   ∀ a, Foot rs a → (∀ m, s.proc.mm.mem.map (pageOf a) = some m → m.special = false) ∧
     pageOf a ∉ s.proc.mm.mem.growsDown
+
+/-- No byte of the regions `rs` lies in a page of a mapping of huge pages (`Mapping.huge`, `MAP_HUGETLB`): pages whose
+layout can be changed at any page boundary, as the kernel refuses to split a mapping of huge pages inside a huge page
+(`Memory.cutsHuge`). `execve` maps no huge pages. -/
+def NotHuge (s : State) (rs : List Rgn) : Prop :=
+  ∀ a, Foot rs a → ∀ m, s.proc.mm.mem.map (pageOf a) = some m → m.huge = none
+
+/-- Each region of `rs` takes the huge pages it touches whole: every huge page of `2 ^ k` bytes (a page of a mapping of
+huge pages, `Mapping.huge = some k`, from a multiple of `2 ^ k`) that holds a byte of the region lies wholly within it.
+So the region starts and ends on the boundaries of the pages of the mappings there, and a change of the layout of
+exactly the region cuts no huge page (`Memory.cutsHuge`; the kernel refuses such a cut, `mm/hugetlb.c`
+`hugetlb_vm_op_split`). Regions in no huge page (`NotHuge`) take none. -/
+def HugeAligned (s : State) (rs : List Rgn) : Prop :=
+  ∀ r ∈ rs, ∀ a, r.Mem a → ∀ m k, s.proc.mm.mem.map (pageOf a) = some m → m.huge = some k →
+    r.base.toNat ≤ a.toNat / 2 ^ k * 2 ^ k ∧ a.toNat / 2 ^ k * 2 ^ k + 2 ^ k ≤ r.base.toNat + r.len
 
 /-- The bytes at `a` in `s` are `bs` (as memory holds them; whether they are accessible is
 a separate fact, `Accessible`). -/
@@ -163,11 +190,13 @@ stores and the kernel's updates, without `mmap`, `munmap` or `mremap`: the same 
 for a kernel page with or without a source as before, except that a private file mapping not yet written becomes a private copy at its first store
 (copy on write, `mm/memory.c` `do_wp_page`), which happens only for a page within the file, since
 an access to one beyond the end raises `SIGBUS` (`Files.beyondEof`), and that a lazily freed page
-becomes private memory again at a store or when the kernel drops it (`EnvEvent.reclaim`). -/
+becomes private memory again at a store or when the kernel drops it (`EnvEvent.reclaim`). A page of a huge page not
+yet allocated (`Backing.hugeEmpty`) stays so: its allocation, at a fault (`hugeFault`), is not among these updates. -/
 def Backing.Refines (fs : Files) : Backing → Backing → Prop
   | .priv _, .priv _ => True
   | .priv _, .freed _ => True
   | .freed _, .freed _ => True
+  | .hugeEmpty, .hugeEmpty => True
   | .kernel f', .kernel f => f'.isSome = f.isSome
   | .priv _, .cow fp => fs.beyondEof fp = false
   | .cow fp', .cow fp => fp' = fp

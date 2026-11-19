@@ -1,6 +1,7 @@
 import ZellicX86.Spec.Linux.Syscall.Writev
 import ZellicX86.Spec.Linux.Syscall.ReadWrite
 import ZellicX86.Spec.Linux.Syscall.Mm
+import ZellicX86.Spec.Linux.Syscall.Prctl
 import ZellicX86.Spec.Linux.Syscall.Task
 import ZellicX86.Spec.Linux.Syscall.Files
 import ZellicX86.Spec.Linux.Syscall.Fd
@@ -60,7 +61,7 @@ def syscall (prof : Profile) (s : State) : Req StepResult :=
     | 3 => sysClose s
     | 5 => sysFstat prof s
     | 8 => sysLseek s
-    | 9 => sysMmap feat s
+    | 9 => sysMmap prof s
     | 10 => sysMprotect feat s
     | 11 => sysMunmap feat s
     | 12 => sysBrk feat s
@@ -71,8 +72,8 @@ def syscall (prof : Profile) (s : State) : Req StepResult :=
     | 17 => sysPread64 prof s
     | 18 => sysPwrite64 prof s
     | 20 => sysWritev prof s
-    | 25 => sysMremap feat s
-    | 28 => sysMadvise feat s
+    | 25 => sysMremap feat prof.linux.stackGuardGap s
+    | 28 => sysMadvise prof s
     | 32 => sysDup s
     | 33 => sysDup2 s
     | 39 => sysGetpid s
@@ -82,6 +83,7 @@ def syscall (prof : Profile) (s : State) : Req StepResult :=
     | 97 => sysGetrlimit prof s
     | 127 => sysRtSigpending prof s
     | 131 => sysSigaltstack prof s
+    | 157 => sysPrctl prof s
     | 158 => sysArchPrctl prof s
     | 160 => sysSetrlimit prof s
     | 186 => sysGetpid s

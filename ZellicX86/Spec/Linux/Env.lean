@@ -20,7 +20,7 @@ with an area registered it stores `cpu_id_start`, `cpu_id`, `node_id` and `mm_ci
 set, the kernel first checks whether `rip` is inside that critical section and may move it to the
 abort handler, which is not modelled (`.error`). `.ok none`: a read or a write failed, and the kernel
 forces `SIGSEGV` (`force_sigsegv`), which its caller does. Its accesses fault into the page-fault
-handler, which may grow a stack for them (`growFor`); where it may (`mayGrowFor`: an area on a page of
+handler, which may grow a stack or allocate a huge page for them (`growFor`); where it may (`mayGrowFor`: an area on a page of
 a stack that was unmapped), a failed update is not modelled (the update is computed without asking the
 environment, so the model cannot follow a stack growth there). On a return from an interrupt or
 exception the kernel also stores 0 into
@@ -33,7 +33,7 @@ def rseqUpdate (feat : Features) (s : State) (cpu node mmCid : BitVec 32) : Exce
   | some r =>
     let failed : Except Outcome (Option State) :=
       if mayGrowFor feat s .write r.area 28 then
-        .error (.notModelled (.feature "an rseq update for which the kernel may grow a stack"))
+        .error (.notModelled (.feature "an rseq update for which the kernel may grow a stack or allocate a huge page"))
       else .ok none
     match kernelRead feat s (r.area.add 8) 8 with
     | none => failed
@@ -71,6 +71,12 @@ def remoteWritable (feat : Features) (mem : Memory) (force : Bool) (a : Addr) : 
     | .file fp => !mem.files.beyondEof fp && m.prot.write
     | .cow fp => !mem.files.beyondEof fp && (m.prot.write || force)
     | .priv _ | .freed _ => m.prot.write || force
+    | .hugeEmpty => false
+
+/-- Whether a tracer's access of the `n` bytes from `a` touches a page of a huge page not yet allocated
+(`Backing.hugeEmpty`): the kernel would fault it in (`get_user_pages`), allocating it or failing; not modelled. -/
+def remoteTouchesHuge (mem : Memory) (a : Addr) (n : Nat) : Bool :=
+  (byteAddrs a n).any fun x => (mem.map (pageOf x)).any fun m => (mem.backings m.backing).unpopulated
 
 /-- Whether a tracer may read the byte at `a` through the kernel with `FOLL_FORCE` (`ptrace(2)`,
 `/proc/PID/mem`; `mm/gup.c` `check_vma_flags`): a user address, mapped, not a page the kernel owns
@@ -84,6 +90,7 @@ def remoteReadable (feat : Features) (mem : Memory) (a : Addr) : Bool :=
     | .kernel _ => false
     | .file fp | .cow fp => !mem.files.beyondEof fp
     | .priv _ | .freed _ => true
+    | .hugeEmpty => false
 
 /-- Whether a tracer's access of the `n` bytes from `a` (`ptrace(2)`, `/proc/PID/mem`:
 `__access_remote_vm`, `mm/memory.c`) may grow a stack in memory `mem`: the first byte it cannot access
@@ -138,13 +145,17 @@ def envEvent (feat : Features) (s : State) : EnvEvent → StepResult
     | .cow fp => .running (s.withMem (s.proc.mm.mem.setBacking b (.priv (s.proc.mm.mem.files.page fp)))) none
     | _ => .running s none
   | .remoteWrite a bs force =>
-    if (byteAddrs a bs.length).all (remoteWritable feat s.proc.mm.mem force) then
+    if remoteTouchesHuge s.proc.mm.mem a bs.length then
+      .stopped (.notModelled (.feature "a tracer's write to a huge page not yet allocated"))
+    else if (byteAddrs a bs.length).all (remoteWritable feat s.proc.mm.mem force) then
       .running (s.withMem (writeBytes s.proc.mm.mem a bs)) none
     else if force && remoteMayGrow feat s.proc.mm.mem (remoteWritable feat s.proc.mm.mem true) a bs.length then
       .stopped (.notModelled (.feature "a tracer's write for which the kernel may grow a stack"))
     else .running s none
   | .remoteRead a n =>
-    if remoteMayGrow feat s.proc.mm.mem (remoteReadable feat s.proc.mm.mem) a n then
+    if remoteTouchesHuge s.proc.mm.mem a n then
+      .stopped (.notModelled (.feature "a tracer's read of a huge page not yet allocated"))
+    else if remoteMayGrow feat s.proc.mm.mem (remoteReadable feat s.proc.mm.mem) a n then
       .stopped (.notModelled (.feature "a tracer's read for which the kernel may grow a stack"))
     else .running s none
   | .tracer w => tracerWrite feat s w

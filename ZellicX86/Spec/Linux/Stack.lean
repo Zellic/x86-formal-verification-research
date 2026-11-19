@@ -1,5 +1,4 @@
-import ZellicX86.Spec.Linux.Basic
-import ZellicX86.Spec.MemoryEval
+import ZellicX86.Spec.Linux.Account
 /-!
 # Linux: growing a stack
 
@@ -56,7 +55,8 @@ covers, in state `s`, on the machine `prof` (its kernel's settings `prof.linux`)
   the VMAs back). It ends at least at the end of the pages of `q`'s area and at most at the end of the
   pages that grow down with `q`'s protection, key and maximum protection (a VMA's flags are the same on
   all its pages); where the two give different answers, the kernel's is one of them (`Request.pick`);
-- the refusals the model does not track (`Request.growFail`): `RLIMIT_AS`, `RLIMIT_MEMLOCK`, the
+- `RLIMIT_AS` against the pages of every VMA and the growth (`Memory.totalVm`);
+- the refusals the model does not track (`Request.growFail`): `RLIMIT_MEMLOCK`, the
   overcommit policy, `vm.mmap_min_addr`, memory for the kernel's structures;
 - `expand_downwards` also refuses a growth by more pages than the VMA's offset (`vm_pgoff`): never for
   the stacks the model has (the initial stack's offset is that of `STACK_TOP_MAX`, `mm/vma_exec.c`
@@ -80,10 +80,36 @@ def growStack (prof : Profile) (s : State) (a : Addr) : Req (Option State) :=
     let fits ← if lim < short then Pure.pure false else if long ≤ lim then Pure.pure true else do
       let c ← Req.request (.pick 1)
       Pure.pure (c.val = 1)
-    if !fits then Pure.pure none else do
-    let refused : Bool ← Req.request .growFail
+    if !fits then Pure.pure none else
+    -- `RLIMIT_AS` (`acct_stack_growth`'s `may_expand_vm`; a stack is no data mapping)
+    if !(mem.totalVm + (q - p) ≤ (s.proc.signal.rlimits RLIMIT_AS).pages) then Pure.pure none else do
+    let refused : Bool ← Req.request (.growFail p)
     if refused then Pure.pure none
     else Pure.pure (some (s.withMem (mem.growDown p (q - p) m)))
+
+/-- Whether access `acc` at `a` faults on a page of a huge page the kernel has not allocated yet (`Backing.hugeEmpty`)
+while the mapping allows it (`accessError`, which the kernel checks first): the fault that allocates the huge page. -/
+def hugeFaultAt (feat : Features) (pkru : BitVec 32) (mem : Memory) (acc : Access) (a : Addr) : Bool :=
+  match mem.map (pageOf a) with
+  | none => false
+  | some m => (mem.backings m.backing).unpopulated && !accessError feat pkru m acc
+
+/-- The kernel's fault at `a` on a page of a huge page not yet allocated (`hugeFaultAt`): `mm/hugetlb.c`
+`hugetlb_no_page` allocates the huge page (`alloc_hugetlb_folio`) and clears it, and the access is made again, or the
+allocation fails (the hugetlb controller's charge, a pool without a page for it: `-ENOSPC`, which `vmf_error` makes
+`VM_FAULT_SIGBUS`), which the environment says for the faulting page (`Request.hugeFail`): the state with the huge page
+allocated (`Memory.populateHuge`), or `none`.
+An allocation that fails with `-ENOMEM` (`alloc_hugetlb_folio`: `vma_needs_reservation` failing, `mm/hugetlb.c`
+2977–2979; the memory cgroup's charge, `mem_cgroup_charge_hugetlb`, 3094–3097) is no refusal: `vmf_error` makes it
+`VM_FAULT_OOM`, not `VM_FAULT_SIGBUS`, and for the process's own access the `#PF` handler calls `pagefault_out_of_memory`
+(`arch/x86/mm/fault.c` 1426–1440, `mm/oom_kill.c` 1195) and returns to user mode, which runs the instruction again: a
+retried fault, eventually granted or the process killed (by the OOM killer: an outside `SIGKILL`, which `Undisturbed`
+excludes); not `SIGBUS`. The grant here covers it; the refusal's `SIGBUS` is `-ENOSPC`'s, more than `-ENOMEM` can give.
+For a kernel access (`growFor`) the exception table's fixup stops the copy in both cases, as the refusal does here. -/
+def hugeFault (s : State) (a : Addr) : Req (Option State) := do
+  let refused : Bool ← Req.request (.hugeFail (pageOf a).toNat)
+  if refused then Pure.pure none
+  else Pure.pure (some (s.withMem (s.proc.mm.mem.populateHuge (pageOf a).toNat)))
 
 /-- Whether the kernel can make access `acc` to the byte at `a` with user access rights in state `s`
 (`kernelRead`'s and `kernelWrite`'s check). -/
@@ -107,9 +133,11 @@ cannot make (`userAccessible`) faults into the kernel's page-fault handler, whic
 of the process (`arch/x86/mm/fault.c` `do_user_addr_fault`; the exception table is consulted only when
 the fault cannot be handled): on a page no mapping covers, below `TASK_SIZE` (`growthFault`), it may grow
 a stack down to it (`growStack`), and the access is made again and goes on; otherwise, or if the access
-is still forbidden on the grown page (`access_error` on the grown VMA), the access stops there. The
-access itself is then `kernelRead` or `kernelWrite` on the state returned. Each growth maps the page of
-a byte of the range, so there are at most as many as its pages (`fuel`). -/
+is still forbidden on the grown page (`access_error` on the grown VMA), the access stops there. A first
+byte on a page of a huge page not yet allocated (`hugeFaultAt`) faults the same way: the handler allocates
+the huge page and the access goes on, or it cannot and the access stops there (`hugeFault`). The
+access itself is then `kernelRead` or `kernelWrite` on the state returned. Each growth or allocation makes
+the page of a byte of the range accessible, so there are at most as many as its pages (`fuel`). -/
 def growFor (prof : Profile) (s : State) (acc : Access) (a : Addr) (n : Nat) : Req State :=
   go s (n / 4096 + 2)
 where
@@ -117,19 +145,31 @@ where
   go (s : State) : Nat → Req State
     | 0 => Pure.pure s
     | fuel + 1 =>
-      match growthFault prof.feat s.proc.mm.mem (userAccessible prof.feat s acc) a n with
-      | none => Pure.pure s
-      | some x => do
-        match ← growStack prof s x with
-        | some s' => go s' fuel
+      let x? := (firstRejected (fun i => userAccessible prof.feat s acc (a.add i)) 0 n).map a.add
+      match x? with
+      | some x =>
+        if hugeFaultAt prof.feat s.cpu.pkru s.proc.mm.mem acc x then do
+          match ← hugeFault s x with
+          | some s' => go s' fuel
+          | none => Pure.pure s
+        else
+        match growthFault prof.feat s.proc.mm.mem (userAccessible prof.feat s acc) a n with
         | none => Pure.pure s
+        | some x => do
+          match ← growStack prof s x with
+          | some s' => go s' fuel
+          | none => Pure.pure s
+      | none => Pure.pure s
 
-/-- Whether the kernel's access `acc` to the `n` user bytes from `a` in state `s` may grow a stack
-(`growFor`): the first byte it cannot make lies below `TASK_SIZE` on a page no mapping covers
-(`growthFault`), with a stack above it within its limit (`stackAbove`). Where the model does not follow
-a growth (a kernel access computed without asking the environment, a call whose answer leaves open which
-bytes the kernel touched), a case where this holds is not modelled. -/
+/-- Whether the kernel's access `acc` to the `n` user bytes from `a` in state `s` may grow a stack or allocate a huge
+page (`growFor`): the first byte it cannot make lies below `TASK_SIZE` on a page no mapping covers
+(`growthFault`), with a stack above it within its limit (`stackAbove`), or on a page of a huge page not yet allocated
+(`hugeFaultAt`). Where the model does not follow such a fault (a kernel access computed without asking the
+environment, a call whose answer leaves open which bytes the kernel touched), a case where this holds is not
+modelled. -/
 def mayGrowFor (feat : Features) (s : State) (acc : Access) (a : Addr) (n : Nat) : Bool :=
+  ((firstRejected (fun i => userAccessible feat s acc (a.add i)) 0 n).map a.add).any
+    (hugeFaultAt feat s.cpu.pkru s.proc.mm.mem acc) ||
   (growthFault feat s.proc.mm.mem (userAccessible feat s acc) a n).any fun x => (stackAbove feat s x).isSome
 
 end ZellicX86

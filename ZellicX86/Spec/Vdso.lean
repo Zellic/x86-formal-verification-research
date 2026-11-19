@@ -85,8 +85,9 @@ written, apart from the frames. Not met by a real image without a precondition o
 def vdsoClockGettime (n : Nat) : Contract where
   conv := sysv
   reads _ := []
-  writes s := [frame s n, ⟨s.cpu.gpr.rsi, 16⟩]
-  pre s := argInt s.cpu.gpr.rdi ∈ vdsoClocks ∧ Apart [frame s n] [⟨s.cpu.gpr.rsi, 16⟩]
+  stack := fun _ => n
+  writes s := [⟨s.cpu.gpr.rsi, 16⟩]
+  pre s := argInt s.cpu.gpr.rdi ∈ vdsoClocks
   post s X := X.cpu.gpr.rax = 0 ∧ ∃ t : Timespec, Bytes X s.cpu.gpr.rsi t.bytes
   events _ _ evs := VdsoEvents 228 evs
 
@@ -97,9 +98,9 @@ the data pages (module header). -/
 def vdsoGettimeofday (n : Nat) : Contract where
   conv := sysv
   reads _ := []
-  writes s := [frame s n, ⟨s.cpu.gpr.rdi, 16⟩] ++ (if s.cpu.gpr.rsi = 0 then [] else [⟨s.cpu.gpr.rsi, 8⟩])
-  pre s := s.cpu.gpr.rdi ≠ 0 ∧ Apart [frame s n] [⟨s.cpu.gpr.rdi, 16⟩] ∧
-    (s.cpu.gpr.rsi ≠ 0 → Apart [frame s n, ⟨s.cpu.gpr.rdi, 16⟩] [⟨s.cpu.gpr.rsi, 8⟩])
+  stack := fun _ => n
+  writes s := [⟨s.cpu.gpr.rdi, 16⟩] ++ (if s.cpu.gpr.rsi = 0 then [] else [⟨s.cpu.gpr.rsi, 8⟩])
+  pre s := s.cpu.gpr.rdi ≠ 0 ∧ (s.cpu.gpr.rsi ≠ 0 → Apart [⟨s.cpu.gpr.rdi, 16⟩] [⟨s.cpu.gpr.rsi, 8⟩])
   post s X := X.cpu.gpr.rax = 0 ∧
     ∃ sec usec : BitVec 64, usec.toNat < 1000000 ∧ Bytes X s.cpu.gpr.rdi (toBytesLE sec 8 ++ toBytesLE usec 8)
   events _ _ evs := VdsoEvents 96 evs
@@ -109,8 +110,9 @@ met by a real image without a precondition on the data pages (module header). -/
 def vdsoTime (n : Nat) : Contract where
   conv := sysv
   reads _ := []
-  writes s := [frame s n] ++ (if s.cpu.gpr.rdi = 0 then [] else [⟨s.cpu.gpr.rdi, 8⟩])
-  pre s := s.cpu.gpr.rdi ≠ 0 → Apart [frame s n] [⟨s.cpu.gpr.rdi, 8⟩]
+  stack := fun _ => n
+  writes s := (if s.cpu.gpr.rdi = 0 then [] else [⟨s.cpu.gpr.rdi, 8⟩])
+  pre _ := True
   post s X := s.cpu.gpr.rdi ≠ 0 → Bytes X s.cpu.gpr.rdi (toBytesLE X.cpu.gpr.rax 8)
   events _ _ evs := VdsoEvents 201 evs
 
@@ -120,11 +122,10 @@ def vdsoTime (n : Nat) : Contract where
 def vdsoGetcpu (n : Nat) : Contract where
   conv := sysv
   reads _ := []
-  writes s := [frame s n] ++ (if s.cpu.gpr.rdi = 0 then [] else [⟨s.cpu.gpr.rdi, 4⟩]) ++
+  stack := fun _ => n
+  writes s := (if s.cpu.gpr.rdi = 0 then [] else [⟨s.cpu.gpr.rdi, 4⟩]) ++
     (if s.cpu.gpr.rsi = 0 then [] else [⟨s.cpu.gpr.rsi, 4⟩])
-  pre s := (s.cpu.gpr.rdi ≠ 0 → Apart [frame s n] [⟨s.cpu.gpr.rdi, 4⟩]) ∧
-    (s.cpu.gpr.rsi ≠ 0 → Apart [frame s n] [⟨s.cpu.gpr.rsi, 4⟩]) ∧
-    (s.cpu.gpr.rdi ≠ 0 → s.cpu.gpr.rsi ≠ 0 → Apart [⟨s.cpu.gpr.rdi, 4⟩] [⟨s.cpu.gpr.rsi, 4⟩])
+  pre s := (s.cpu.gpr.rdi ≠ 0 → s.cpu.gpr.rsi ≠ 0 → Apart [⟨s.cpu.gpr.rdi, 4⟩] [⟨s.cpu.gpr.rsi, 4⟩])
   post _ X := X.cpu.gpr.rax = 0
   events _ _ evs := VdsoEvents 309 evs
 
@@ -135,9 +136,9 @@ protection and flags of the state's memory (`PROT_READ | PROT_WRITE`, `MAP_DROPP
 def vdsoGetrandomQuery (n : Nat) : Contract where
   conv := sysv
   reads _ := []
-  writes s := [frame s n, ⟨s.cpu.gpr.rcx, 64⟩]
-  pre s := s.cpu.gpr.rdi = 0 ∧ s.cpu.gpr.rsi = 0 ∧ arg32 s.cpu.gpr.rdx = 0 ∧ s.cpu.gpr.r8 = -1 ∧
-    Apart [frame s n] [⟨s.cpu.gpr.rcx, 64⟩]
+  stack := fun _ => n
+  writes s := [⟨s.cpu.gpr.rcx, 64⟩]
+  pre s := s.cpu.gpr.rdi = 0 ∧ s.cpu.gpr.rsi = 0 ∧ arg32 s.cpu.gpr.rdx = 0 ∧ s.cpu.gpr.r8 = -1
   post s X := X.cpu.gpr.rax = 0 ∧ ∃ size : BitVec 32,
     Bytes X s.cpu.gpr.rcx (toBytesLE size 4 ++ toBytesLE (3 : BitVec 32) 4 ++ toBytesLE (0x28 : BitVec 32) 4 ++
       List.replicate 52 0)

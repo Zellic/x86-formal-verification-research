@@ -201,10 +201,13 @@ def AltStack.disabled : AltStack := ⟨0, 0, SS_DISABLE⟩
 
 /-- A signal waiting to be delivered: the kernel's queue entry (`struct sigqueue`) with what it
 records (`SigInfo`), and why it was sent, which the outcome reports if the signal ends the process
-(`KillCause`; the kernel does not keep it). -/
+(`KillCause`; the kernel does not keep it). Never a refused huge page's (`KillCause.hugeFault`): that `SIGBUS` is
+queued only where a handler takes it at once (`signalException`), so its entry never ends the process, and records the
+exception. -/
 structure Queued where
   info : SigInfo
   cause : KillCause
+  notHuge : cause.isHugeFault = false := by rfl
 
 /-- Pending signals (`struct sigpending`, `include/linux/signal_types.h`), oldest first: a signal is
 pending if an entry for it is. A signal 1–31 has at most one entry (`legacy_queue`,
@@ -340,15 +343,16 @@ def RLIMIT_NOFILE : Fin 16 := 7
 
 /-- The number of the data segment's limit, `RLIMIT_DATA` (`include/uapi/asm-generic/resource.h`): the bytes of the
 private writable mappings and of the heap (`mm/mmap.c` `may_expand_vm`'s `data_vm`, `brk`'s `check_data_rlimit`). The
-model's `brk` and `mmap` do not check it: a refusal for it is a `Request.memFail` answer. -/
+model checks it where the kernel does: `brk`'s `check_data_rlimit` (`Mm.dataFits`) and `may_expand_vm` in `brk`, `mmap`
+and `mremap` (`mayExpandVm`, against `Memory.dataVm`). -/
 def RLIMIT_DATA : Fin 16 := 2
 
 /-- The number of the stack's resource limit, `RLIMIT_STACK` (`include/uapi/asm-generic/resource.h`). -/
 def RLIMIT_STACK : Fin 16 := 3
 
 /-- The number of the address space's limit, `RLIMIT_AS` (`include/uapi/asm-generic/resource.h`): the bytes of all
-mappings (`may_expand_vm`'s `total_vm`). The model's `brk` and `mmap` do not check it: a refusal for it is a
-`Request.memFail` answer. -/
+mappings (`may_expand_vm`'s `total_vm`). The model checks it where the kernel does: `may_expand_vm` in `brk`, `mmap`
+and `mremap` (`mayExpandVm`, against `Memory.totalVm`) and the stack's growth (`acct_stack_growth`). -/
 def RLIMIT_AS : Fin 16 := 9
 
 /-- The address space (`struct mm_struct`, `include/linux/mm_types.h`), which threads created with
@@ -363,6 +367,12 @@ structure Mm where
   brkMin : Addr
   /-- Current program break (`mm->brk`). -/
   brk : Addr
+  /-- The initial program break (`mm->start_brk`), which `RLIMIT_DATA`'s check in `brk(2)` counts from. -/
+  startBrk : Addr
+  /-- The highest loadable segment's start (`mm->start_data`, `load_elf_binary`). -/
+  startData : Addr
+  /-- The end of the loadable segments' file bytes (`mm->end_data`, `load_elf_binary`). -/
+  endData : Addr
 
 /-- A descriptor's entry in the descriptor table: the open file description it refers to (`fdt->fd`)
 and its close-on-exec flag (`FD_CLOEXEC`, the `fdt->close_on_exec` bit; `include/linux/fdtable.h`),

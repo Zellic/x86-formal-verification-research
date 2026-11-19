@@ -36,17 +36,24 @@ What follows lists the limits by area. It is a summary; the model's definitions 
   prefix.
 - **Implemented:** the general-purpose integer instructions compilers emit, BMI1/BMI2, LZCNT, the x87 unit, and large
   parts of SSE through AVX2. For AVX-512, the integer subset: moves, logic, add/subtract, min/max, compares into opmasks,
-  broadcasts, packs, multiplies, and the opmask instructions.
+  broadcasts, packs, multiplies, and the opmask instructions. Among these: the packed widening moves (`PMOVSX*`,
+  `PMOVZX*` and their VEX and EVEX forms), the shuffles and byte shifts within 128-bit lanes (`VPSHUFD`, `VPSHUFLW`,
+  `VPSHUFHW`, `VPSRLDQ`, `VPSLLDQ`), the permutes `VPERMD`, `VPERMQ`, `VPERM2I128`, `VPERMT2D` and `VPERMI2D`, the
+  gathers, and the save and restore of processor state (`XSAVE`, `XSAVEC`, `XRSTOR` and their 64-bit forms).
 - **Not implemented** (a run that reaches one ends as not modelled):
-  - AVX-512 floating point, gathers and scatters, the lane-crossing shuffles and permutes, and the other SSE/AVX
-    instructions outside the implemented part (the decoder's tables, `ZellicX86/Spec/Decode/Maps.lean`, are the exact list);
+  - AVX-512 floating point (but for the gathers of floating-point elements), scatters, the other shuffles and permutes
+    across lanes (among them the quadword two-table permutes `VPERMT2Q`, `VPERMI2Q`), and the other SSE/AVX
+    instructions outside the implemented part (the decoder's tables, `ZellicX86/Spec/Decode/Maps.lean`, are the exact
+    list);
   - all MMX instructions;
   - the x87 transcendentals (`FSIN`, `FCOS`, `FPTAN`, `FPATAN`, `F2XM1`, `FYL2X`, …);
   - `POPCNT`, `CMPXCHG8B`/`CMPXCHG16B`, `RDRAND`/`RDSEED`, ADX, AES-NI, PCLMULQDQ;
   - `RCL`, `RCR` and `PAUSE` (decoded, not executed);
   - flags and system instructions such as `PUSHF`/`POPF`, `LAHF`/`SAHF`, `CLC`/`STC`, `ENTER`, `XLAT`, segment-register
     moves, far returns, `INT n`, `IN`/`OUT`;
-  - transactional memory (`XBEGIN`/`XEND`/`XABORT`), and the shadow-stack instructions;
+  - transactional memory (`XBEGIN`/`XEND`/`XABORT`; `XTEST` is implemented), and the shadow-stack instructions
+    (`RDSSP` and `INCSSP` are implemented for a thread without a user shadow stack only);
+  - `XSAVEOPT`, `XSAVES`, `XRSTORS`;
   - a few narrow cases of implemented instructions (a shift or rotate of memory by a masked count of 0, `F2` on string
     moves, 16-bit `PUSH`, `POP` and `LEAVE`, the `66`-prefixed forms of `JRCXZ`, `LOOP` and `Jcc`, x87 rounding under
     the reserved precision control, among others).
@@ -77,6 +84,14 @@ What follows lists the limits by area. It is a summary; the model's definitions 
   - the decoding of a few encodings both manuals leave blank or disagree on: `FF /7` is `#UD`, and `VZEROUPPER`/
     `VZEROALL` with `VEX.W=1` execute.
 
+  In a few such cases the model does not follow the Zen 4, and a run that reaches one ends as not modelled. On AMD: an
+  `XSAVE` in the standard format of x87 or AVX state without SSE state (the APM and the SDM select the `MXCSR` save by
+  different bits), an `XRSTOR` in the compacted format of SSE state in its initial configuration, and nonzero reserved
+  bytes 24–63 of a standard save area's header, for `XRSTOR` and for `rt_sigreturn`'s signal frame alike. On both
+  vendors, a compacted `XRSTOR` whose header sets bit 63 of `XSTATE_BV` (the Zen 4 faults). On Intel, an `XRSTOR` that
+  loads x87 state whose status word's `ES`/`B` summary bits or control word's reserved bits do not have the values the
+  model can follow.
+
   The docstrings that cite "an AMD Zen 4" name such observations; the measurements themselves are not part of this
   release.
 - **The time-stamp counter** (`RDTSC`) reads an arbitrary value: nothing relates two readings.
@@ -89,6 +104,10 @@ What follows lists the limits by area. It is a summary; the model's definitions 
   encoding), the outcome is not modelled. So is the `#UD` of an instruction whose feature the processor lacks unless
   all 15 bytes from the instruction's start can be fetched (a processor without the feature may decode another
   length).
+- Two instructions that access several separate places end as not modelled where one access faults, instead of with
+  the fault (the processor's state after such a partial completion is not modelled): a gather whose access of a selected
+  element faults, and an `XSAVE`, `XSAVEC` or `XRSTOR` whose save area, with every component it may write or read, is
+  not wholly accessible.
 
 ## Memory
 
@@ -99,12 +118,14 @@ What follows lists the limits by area. It is a summary; the model's definitions 
   of non-temporal stores is not modelled. Other agents' writes (a debugger, `/proc/PID/mem`, a file written through
   another mapping) are events between instructions: each instruction is atomic to them, which real hardware does not
   guarantee (a torn access or a lost update of an unlocked read-modify-write is not covered). The kernel's reclaim of
-  lazily freed (`MADV_FREE`) pages also happens between instructions. The theorems here assume no writes by others.
+  lazily freed (`MADV_FREE`) pages also happens between instructions. A tracer's write while the process is stopped
+  inside a system call is not modelled. The theorems here assume no writes by others.
 - **Caches, timing and speculative execution** are not modelled; side channels are out of scope.
 - **Not modelled mappings:** devices and special files (`/dev/zero`, hugetlbfs, DAX), `MAP_SYNC`, `MAP_HUGETLB`,
   `MAP_DROPPABLE`, `MAP_LOCKED`, private `MAP_GROWSDOWN`, `PROT_GROWSDOWN`/`PROT_GROWSUP`, execute-only memory with
-  protection keys, changes over the vDSO or the initial stack's first page, `mremap` of stack pages, and the
-  configuration-dependent `madvise` advice (KSM, transparent huge pages, memory poisoning).
+  protection keys, changes over the vDSO or the initial stack's first page, `mremap` of stack pages, `memfd_secret`
+  memory, the copy-on-write breaks that `mlock` and `MAP_POPULATE` make, and the configuration-dependent `madvise`
+  advice (KSM, transparent huge pages, memory poisoning).
 
 ## Linux
 

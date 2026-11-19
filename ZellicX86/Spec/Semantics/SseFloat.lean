@@ -360,7 +360,8 @@ def Sem.fpCmp (prof : Profile) (t : FpTy) (i : Inst) : Prog Ctl :=
 two operands and set `ZF`, `PF`, `CF` to 111 for unordered, 000 for greater, 001 for less, 100 for
 equal, and clear `OF`, `SF`, `AF` (SDM Vol. 2, "COMISD", "UCOMISD", Operation). The invalid-operation
 condition comes with any NaN operand for `COMIS*`, with a signaling one only for `UCOMIS*` (SDM
-Vol. 1, 11.5.2.1). With an unmasked exception `RFLAGS` is not changed. -/
+Vol. 1, 11.5.2.1; AMD APM Vol. 4, COMISD/COMISS, pp. 97–102, and
+UCOMISD/UCOMISS, pp. 791–794). With an unmasked exception `RFLAGS` is not changed. -/
 def Sem.fpComi (prof : Profile) (t : FpTy) (signal : Bool) (i : Inst) : Prog Ctl :=
   match i.ops with
   | [s₁, s₂] => do
